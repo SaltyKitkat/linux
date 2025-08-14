@@ -38,6 +38,28 @@ static int push_node_left(struct btrfs_trans_handle *trans,
 static int balance_node_right(struct btrfs_trans_handle *trans,
 			      struct extent_buffer *dst_buf,
 			      struct extent_buffer *src_buf);
+
+/*
+ * Defines the high watermark threshold for node rebalancing.
+ * When a node's item count exceeds this value (currently 90% of capacity),
+ * it is considered too full and will not receive more items during rebalancing.
+ */
+static u32 node_balance_himark(const struct btrfs_fs_info *fs_info)
+{
+	u32 cap = BTRFS_NODEPTRS_PER_BLOCK(fs_info);
+	return mult_perc(cap, 90);
+}
+
+/*
+ * Defines the low watermark threshold for node rebalancing.
+ * When a node's item count falls below this value (60% of capacity),
+ * it is considered too empty and items will not be taken from it during rebalancing.
+ */
+static u32 node_balance_lomark(const struct btrfs_fs_info *fs_info)
+{
+	u32 cap = BTRFS_NODEPTRS_PER_BLOCK(fs_info);
+	return mult_perc(cap, 60);
+}
 /*
  * The leaf data grows from end-to-front in the node.  this returns the address
  * of the start of the last item, which is the stop of the leaf data stack.
