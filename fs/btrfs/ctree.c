@@ -839,6 +839,35 @@ struct extent_buffer *btrfs_read_node_slot(struct extent_buffer *parent,
 			       &check);
 }
 
+static int update_node_key_impl(struct btrfs_trans_handle *trans,
+				struct extent_buffer *parent,
+				int pslot,
+				const struct btrfs_disk_key *key)
+{
+	int ret;
+
+	ret = btrfs_tree_mod_log_insert_key(parent, pslot,
+					    BTRFS_MOD_LOG_KEY_REPLACE);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+	btrfs_set_node_key(parent, key, pslot);
+	btrfs_mark_buffer_dirty(trans, parent);
+	return 0;
+}
+
+static int update_node_key(struct btrfs_trans_handle *trans,
+			   struct extent_buffer *parent,
+			   int pslot,
+			   const struct extent_buffer *eb)
+{
+	struct btrfs_disk_key key;
+
+	btrfs_node_key(eb, &key, 0);
+	return update_node_key_impl(trans, parent, pslot, &key);
+}
+
 /*
  * Promote a child node to become the new tree root.
  *
@@ -1026,16 +1055,9 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 				goto out;
 			}
 		} else {
-			struct btrfs_disk_key right_key;
-			btrfs_node_key(right, &right_key, 0);
-			ret = btrfs_tree_mod_log_insert_key(parent, pslot + 1,
-					BTRFS_MOD_LOG_KEY_REPLACE);
-			if (unlikely(ret < 0)) {
-				btrfs_abort_transaction(trans, ret);
+			ret = update_node_key(trans, parent, pslot + 1, right);
+			if (ret)
 				goto out;
-			}
-			btrfs_set_node_key(parent, &right_key, pslot + 1);
-			btrfs_mark_buffer_dirty(trans, parent);
 		}
 	}
 	if (btrfs_header_nritems(mid) == 1) {
@@ -1088,16 +1110,9 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 		}
 	} else {
 		/* update the parent key to reflect our changes */
-		struct btrfs_disk_key mid_key;
-		btrfs_node_key(mid, &mid_key, 0);
-		ret = btrfs_tree_mod_log_insert_key(parent, pslot,
-						    BTRFS_MOD_LOG_KEY_REPLACE);
-		if (unlikely(ret < 0)) {
-			btrfs_abort_transaction(trans, ret);
+		ret = update_node_key(trans, parent, pslot, mid);
+		if (ret)
 			goto out;
-		}
-		btrfs_set_node_key(parent, &mid_key, pslot);
-		btrfs_mark_buffer_dirty(trans, parent);
 	}
 
 	/* update the path */
@@ -1192,19 +1207,13 @@ static noinline int push_nodes_for_insert(struct btrfs_trans_handle *trans,
 		if (wret < 0)
 			ret = wret;
 		if (wret == 0) {
-			struct btrfs_disk_key disk_key;
 			orig_slot += left_nr;
-			btrfs_node_key(mid, &disk_key, 0);
-			ret = btrfs_tree_mod_log_insert_key(parent, pslot,
-					BTRFS_MOD_LOG_KEY_REPLACE);
-			if (unlikely(ret < 0)) {
+			ret = update_node_key(trans, parent, pslot, mid);
+			if (ret) {
 				btrfs_tree_unlock(left);
 				free_extent_buffer(left);
-				btrfs_abort_transaction(trans, ret);
 				return ret;
 			}
-			btrfs_set_node_key(parent, &disk_key, pslot);
-			btrfs_mark_buffer_dirty(trans, parent);
 			if (btrfs_header_nritems(left) > orig_slot) {
 				path->nodes[level] = left;
 				path->slots[level + 1] -= 1;
@@ -1252,20 +1261,12 @@ static noinline int push_nodes_for_insert(struct btrfs_trans_handle *trans,
 		if (wret < 0)
 			ret = wret;
 		if (wret == 0) {
-			struct btrfs_disk_key disk_key;
-
-			btrfs_node_key(right, &disk_key, 0);
-			ret = btrfs_tree_mod_log_insert_key(parent, pslot + 1,
-					BTRFS_MOD_LOG_KEY_REPLACE);
-			if (unlikely(ret < 0)) {
+			ret = update_node_key(trans, parent, pslot + 1, right);
+			if (ret) {
 				btrfs_tree_unlock(right);
 				free_extent_buffer(right);
-				btrfs_abort_transaction(trans, ret);
 				return ret;
 			}
-			btrfs_set_node_key(parent, &disk_key, pslot + 1);
-			btrfs_mark_buffer_dirty(trans, parent);
-
 			if (btrfs_header_nritems(mid) <= orig_slot) {
 				path->nodes[level] = right;
 				path->slots[level + 1] += 1;
@@ -2498,21 +2499,15 @@ static void fixup_low_keys(struct btrfs_trans_handle *trans,
 			   const struct btrfs_path *path,
 			   const struct btrfs_disk_key *key, int level)
 {
-	int i;
-	struct extent_buffer *t;
-	int ret;
-
-	for (i = level; i < BTRFS_MAX_LEVEL; i++) {
+	for (int i = level; i < BTRFS_MAX_LEVEL; i++) {
 		int tslot = path->slots[i];
+		int ret;
 
 		if (!path->nodes[i])
 			break;
-		t = path->nodes[i];
-		ret = btrfs_tree_mod_log_insert_key(t, tslot,
-						    BTRFS_MOD_LOG_KEY_REPLACE);
-		BUG_ON(ret < 0);
-		btrfs_set_node_key(t, key, tslot);
-		btrfs_mark_buffer_dirty(trans, path->nodes[i]);
+		ret = update_node_key_impl(trans, path->nodes[i], tslot, key);
+		if (ret)
+			break;
 		if (tslot != 0)
 			break;
 	}
