@@ -960,6 +960,158 @@ static int promote_child_to_root(struct btrfs_trans_handle *trans,
 }
 
 /*
+ * Check key order of two sibling extent buffers.
+ *
+ * Return true if something is wrong.
+ * Return false if everything is fine.
+ *
+ * Tree-checker only works inside one tree block, thus the following
+ * corruption can not be detected by tree-checker:
+ *
+ * Leaf @left			| Leaf @right
+ * --------------------------------------------------------------
+ * | 1 | 2 | 3 | 4 | 5 | f6 |   | 7 | 8 |
+ *
+ * Key f6 in leaf @left itself is valid, but not valid when the next
+ * key in leaf @right is 7.
+ * This can only be checked at tree block merge time.
+ * And since tree checker has ensured all key order in each tree block
+ * is correct, we only need to bother the last key of @left and the first
+ * key of @right.
+ */
+static bool check_sibling_keys(const struct extent_buffer *left,
+			       const struct extent_buffer *right)
+{
+	struct btrfs_key left_last;
+	struct btrfs_key right_first;
+	int level = btrfs_header_level(left);
+	int nr_left = btrfs_header_nritems(left);
+	int nr_right = btrfs_header_nritems(right);
+
+	/* No key to check in one of the tree blocks */
+	if (!nr_left || !nr_right)
+		return false;
+
+	if (level) {
+		btrfs_node_key_to_cpu(left, &left_last, nr_left - 1);
+		btrfs_node_key_to_cpu(right, &right_first, 0);
+	} else {
+		btrfs_item_key_to_cpu(left, &left_last, nr_left - 1);
+		btrfs_item_key_to_cpu(right, &right_first, 0);
+	}
+
+	if (unlikely(btrfs_comp_cpu_keys(&left_last, &right_first) >= 0)) {
+		btrfs_crit(left->fs_info, "left extent buffer:");
+		btrfs_print_tree(left, false);
+		btrfs_crit(left->fs_info, "right extent buffer:");
+		btrfs_print_tree(right, false);
+		btrfs_crit(left->fs_info,
+"bad key order, sibling blocks, left last " BTRFS_KEY_FMT " right first " BTRFS_KEY_FMT,
+			   BTRFS_KEY_FMT_VALUE(&left_last),
+			   BTRFS_KEY_FMT_VALUE(&right_first));
+		return true;
+	}
+	return false;
+}
+
+static int node_balance_move_l(struct btrfs_trans_handle *trans,
+			       struct extent_buffer *l,
+			       struct extent_buffer *r,
+			       u32 npush)
+{
+	u32 l_nr = btrfs_header_nritems(l);
+	u32 r_nr = btrfs_header_nritems(r);
+	int ret = 0;
+
+	WARN_ON(btrfs_header_generation(l) != trans->transid);
+	WARN_ON(btrfs_header_generation(r) != trans->transid);
+
+	ASSERT(npush > 0);
+
+	npush = min(npush, r_nr);
+
+	if (unlikely(check_sibling_keys(l, r))) {
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	ret = btrfs_tree_mod_log_eb_copy(l, r, l_nr, 0, npush);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	copy_extent_buffer(l, r, btrfs_node_key_ptr_offset(l, l_nr),
+				 btrfs_node_key_ptr_offset(r, 0),
+				 npush * sizeof(struct btrfs_key_ptr));
+
+	if (npush < r_nr) {
+		/*
+		 * btrfs_tree_mod_log_eb_copy handles logging the move, so we
+		 * don't need to do an explicit tree mod log operation for it.
+		 */
+		memmove_extent_buffer(r, btrfs_node_key_ptr_offset(r, 0),
+					 btrfs_node_key_ptr_offset(r, npush),
+					 (r_nr - npush) * sizeof(struct btrfs_key_ptr));
+	}
+
+	btrfs_set_header_nritems(r, r_nr - npush);
+	btrfs_set_header_nritems(l, l_nr + npush);
+	btrfs_mark_buffer_dirty(trans, l);
+	btrfs_mark_buffer_dirty(trans, r);
+
+	return ret;
+}
+
+static int node_balance_move_r(struct btrfs_trans_handle *trans,
+			       struct extent_buffer *l,
+			       struct extent_buffer *r,
+			       u32 npush)
+{
+	u32 l_nr = btrfs_header_nritems(l);
+	u32 r_nr = btrfs_header_nritems(r);
+	int ret = 0;
+
+	WARN_ON(btrfs_header_generation(l) != trans->transid);
+	WARN_ON(btrfs_header_generation(r) != trans->transid);
+
+	ASSERT(npush > 0);
+
+	npush = min(npush, l_nr);
+
+	if (unlikely(check_sibling_keys(l, r))) {
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	memmove_extent_buffer(r, btrfs_node_key_ptr_offset(r, npush),
+				 btrfs_node_key_ptr_offset(r, 0),
+				 r_nr * sizeof(struct btrfs_key_ptr));
+	/*
+	 * btrfs_tree_mod_log_eb_copy handles logging the move, so we don't
+	 * need to do an explicit tree mod log operation for it.
+	 */
+	ret = btrfs_tree_mod_log_eb_copy(r, l, 0, l_nr - npush, npush);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	copy_extent_buffer(r, l, btrfs_node_key_ptr_offset(r, 0),
+				 btrfs_node_key_ptr_offset(l, l_nr - npush),
+				 npush * sizeof(struct btrfs_key_ptr));
+
+	btrfs_set_header_nritems(r, r_nr + npush);
+	btrfs_set_header_nritems(l, l_nr - npush);
+	btrfs_mark_buffer_dirty(trans, l);
+	btrfs_mark_buffer_dirty(trans, r);
+
+	return ret;
+}
+
+/*
  * node level balancing, used to make sure nodes are in proper order for
  * item deletion.  We balance from the top down, so we have to make sure
  * that a deletion won't leave an node completely empty later on.
@@ -2584,61 +2736,6 @@ void btrfs_set_item_key_safe(struct btrfs_trans_handle *trans,
 	btrfs_mark_buffer_dirty(trans, eb);
 	if (slot == 0)
 		fixup_low_keys(trans, path, &disk_key, 1);
-}
-
-/*
- * Check key order of two sibling extent buffers.
- *
- * Return true if something is wrong.
- * Return false if everything is fine.
- *
- * Tree-checker only works inside one tree block, thus the following
- * corruption can not be detected by tree-checker:
- *
- * Leaf @left			| Leaf @right
- * --------------------------------------------------------------
- * | 1 | 2 | 3 | 4 | 5 | f6 |   | 7 | 8 |
- *
- * Key f6 in leaf @left itself is valid, but not valid when the next
- * key in leaf @right is 7.
- * This can only be checked at tree block merge time.
- * And since tree checker has ensured all key order in each tree block
- * is correct, we only need to bother the last key of @left and the first
- * key of @right.
- */
-static bool check_sibling_keys(const struct extent_buffer *left,
-			       const struct extent_buffer *right)
-{
-	struct btrfs_key left_last;
-	struct btrfs_key right_first;
-	int level = btrfs_header_level(left);
-	int nr_left = btrfs_header_nritems(left);
-	int nr_right = btrfs_header_nritems(right);
-
-	/* No key to check in one of the tree blocks */
-	if (!nr_left || !nr_right)
-		return false;
-
-	if (level) {
-		btrfs_node_key_to_cpu(left, &left_last, nr_left - 1);
-		btrfs_node_key_to_cpu(right, &right_first, 0);
-	} else {
-		btrfs_item_key_to_cpu(left, &left_last, nr_left - 1);
-		btrfs_item_key_to_cpu(right, &right_first, 0);
-	}
-
-	if (unlikely(btrfs_comp_cpu_keys(&left_last, &right_first) >= 0)) {
-		btrfs_crit(left->fs_info, "left extent buffer:");
-		btrfs_print_tree(left, false);
-		btrfs_crit(left->fs_info, "right extent buffer:");
-		btrfs_print_tree(right, false);
-		btrfs_crit(left->fs_info,
-"bad key order, sibling blocks, left last " BTRFS_KEY_FMT " right first " BTRFS_KEY_FMT,
-			   BTRFS_KEY_FMT_VALUE(&left_last),
-			   BTRFS_KEY_FMT_VALUE(&right_first));
-		return true;
-	}
-	return false;
 }
 
 /*
