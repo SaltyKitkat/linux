@@ -1117,214 +1117,250 @@ static void free_balance_control(struct node_balance_ctl *bctl)
 }
 
 /*
- * node level balancing, used to make sure nodes are in proper order for
- * item deletion.  We balance from the top down, so we have to make sure
- * that a deletion won't leave an node completely empty later on.
+ * Try to merge the current node (m) into its left (l) or right (r) sibling.
+ * This function also handles path updates and node deletion.
  */
-static noinline int balance_level(struct btrfs_trans_handle *trans,
-			 struct btrfs_root *root,
-			 struct btrfs_path *path, int level)
+static int try_merge_nodes(struct btrfs_trans_handle *trans,
+			   struct btrfs_root *root,
+			   struct btrfs_path *path,
+			   int level,
+			   struct node_balance_ctl *bctl,
+			   int orig_slot)
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
-	struct extent_buffer *right = NULL;
-	struct extent_buffer *mid;
-	struct extent_buffer *left = NULL;
-	struct extent_buffer *parent = NULL;
-	int ret = 0;
 	int wret;
-	int pslot;
-	int orig_slot = path->slots[level];
-	u64 orig_ptr;
+	int ret;
+	u32 l_nr, r_nr;
 
-	ASSERT(level > 0);
-
-	mid = path->nodes[level];
-
-	WARN_ON(path->locks[level] != BTRFS_WRITE_LOCK);
-	WARN_ON(btrfs_header_generation(mid) != trans->transid);
-
-	orig_ptr = btrfs_node_blockptr(mid, orig_slot);
-
-	if (level < BTRFS_MAX_LEVEL - 1) {
-		parent = path->nodes[level + 1];
-		pslot = path->slots[level + 1];
-	}
-
-	/*
-	 * deal with the case where there is only one pointer in the root
-	 * by promoting the node below to a root
-	 */
-	if (!parent) {
-		if (btrfs_header_nritems(mid) != 1)
-			return 0;
-
-		return promote_child_to_root(trans, root, path, level, mid);
-	}
-	if (btrfs_header_nritems(mid) >
-	    BTRFS_NODEPTRS_PER_BLOCK(fs_info) / 4)
-		return 0;
-
-	if (pslot) {
-		left = btrfs_read_node_slot(parent, pslot - 1);
-		if (IS_ERR(left)) {
-			ret = PTR_ERR(left);
-			left = NULL;
-			goto out;
-		}
-
-		btrfs_tree_lock_nested(left, BTRFS_NESTING_LEFT);
-		wret = btrfs_cow_block(trans, root, left,
-				       parent, pslot - 1, &left,
-				       BTRFS_NESTING_LEFT_COW);
-		if (wret) {
-			ret = wret;
-			goto out;
-		}
-	}
-
-	if (pslot + 1 < btrfs_header_nritems(parent)) {
-		right = btrfs_read_node_slot(parent, pslot + 1);
-		if (IS_ERR(right)) {
-			ret = PTR_ERR(right);
-			right = NULL;
-			goto out;
-		}
-
-		btrfs_tree_lock_nested(right, BTRFS_NESTING_RIGHT);
-		wret = btrfs_cow_block(trans, root, right,
-				       parent, pslot + 1, &right,
-				       BTRFS_NESTING_RIGHT_COW);
-		if (wret) {
-			ret = wret;
-			goto out;
-		}
-	}
-
-	/* first, try to make some room in the middle buffer */
-	if (left) {
-		orig_slot += btrfs_header_nritems(left);
-		wret = push_node_left(trans, left, mid, 1);
-		if (wret < 0)
-			ret = wret;
-	}
-
-	/*
-	 * then try to empty the right most buffer into the middle
-	 */
-	if (right) {
-		wret = push_node_left(trans, mid, right, 1);
-		if (wret < 0 && wret != -ENOSPC)
-			ret = wret;
-		if (btrfs_header_nritems(right) == 0) {
-			btrfs_clear_buffer_dirty(trans, right);
-			btrfs_tree_unlock(right);
-			ret = btrfs_del_ptr(trans, root, path, level + 1, pslot + 1);
-			if (ret < 0) {
-				free_extent_buffer_stale(right);
-				right = NULL;
-				goto out;
-			}
-			root_sub_used_bytes(root);
-			ret = btrfs_free_tree_block(trans, btrfs_root_id(root),
-						    right, 0, 1);
-			free_extent_buffer_stale(right);
-			right = NULL;
-			if (unlikely(ret < 0)) {
-				btrfs_abort_transaction(trans, ret);
-				goto out;
-			}
-		} else {
-			ret = update_node_key(trans, parent, pslot + 1, right);
-			if (ret)
-				goto out;
-		}
-	}
-	if (btrfs_header_nritems(mid) == 1) {
-		/*
-		 * we're not allowed to leave a node with one item in the
-		 * tree during a delete.  A deletion from lower in the tree
-		 * could try to delete the only pointer in this node.
-		 * So, pull some keys from the left.
-		 * There has to be a left pointer at this point because
-		 * otherwise we would have pulled some pointers from the
-		 * right
-		 */
-		if (unlikely(!left)) {
-			btrfs_crit(fs_info,
-"missing left child when middle child only has 1 item, parent bytenr %llu level %d mid bytenr %llu root %llu",
-				   parent->start, btrfs_header_level(parent),
-				   mid->start, btrfs_root_id(root));
-			ret = -EUCLEAN;
-			btrfs_abort_transaction(trans, ret);
-			goto out;
-		}
-		wret = balance_node_right(trans, mid, left);
-		if (wret < 0) {
-			ret = wret;
-			goto out;
-		}
-		if (wret == 1) {
-			wret = push_node_left(trans, left, mid, 1);
-			if (wret < 0)
-				ret = wret;
-		}
-		BUG_ON(wret == 1);
-	}
-	if (btrfs_header_nritems(mid) == 0) {
-		btrfs_clear_buffer_dirty(trans, mid);
-		btrfs_tree_unlock(mid);
-		ret = btrfs_del_ptr(trans, root, path, level + 1, pslot);
-		if (ret < 0) {
-			free_extent_buffer_stale(mid);
-			mid = NULL;
-			goto out;
-		}
-		root_sub_used_bytes(root);
-		ret = btrfs_free_tree_block(trans, btrfs_root_id(root), mid, 0, 1);
-		free_extent_buffer_stale(mid);
-		mid = NULL;
-		if (unlikely(ret < 0)) {
-			btrfs_abort_transaction(trans, ret);
-			goto out;
-		}
-	} else {
-		/* update the parent key to reflect our changes */
-		ret = update_node_key(trans, parent, pslot, mid);
+	/* Try merging into the left sibling */
+	if (bctl->l) {
+		l_nr = btrfs_header_nritems(bctl->l);
+		ret = btrfs_cow_block(trans, root, bctl->l, bctl->parent,
+				      bctl->pslot - 1, &bctl->l,
+				      BTRFS_NESTING_LEFT_COW);
 		if (ret)
-			goto out;
+			return ret;
+
+		orig_slot += l_nr;
+		wret = node_balance_move_l(trans, bctl->l, bctl->m,
+					   node_balance_himark(fs_info) - l_nr);
+		if (wret < 0)
+			return wret;
 	}
 
-	/* update the path */
-	if (left) {
-		if (btrfs_header_nritems(left) > orig_slot) {
-			/* left was locked after cow */
-			path->nodes[level] = left;
+	/*
+	 * Try merging into the right sibling if items remain in 'm'.
+	 * Note: bctl->m might have been partially emptied in the previous step.
+	 */
+	if (bctl->r && btrfs_header_nritems(bctl->m) > 0) {
+		r_nr = btrfs_header_nritems(bctl->r);
+		ret = btrfs_cow_block(trans, root, bctl->r, bctl->parent,
+				      bctl->pslot + 1, &bctl->r,
+				      BTRFS_NESTING_RIGHT_COW);
+		if (ret)
+			return ret;
+
+		wret = node_balance_move_r(trans, bctl->m, bctl->r,
+					   node_balance_himark(fs_info) - r_nr);
+		if (wret < 0)
+			return wret;
+
+		ret = update_node_key(trans, bctl->parent, bctl->pslot + 1, bctl->r);
+		if (ret)
+			return ret;
+	}
+
+	/* The merge operation should have completely emptied the middle node */
+	ASSERT(btrfs_header_nritems(bctl->m) == 0);
+
+	/* Clean up the middle node */
+	btrfs_clear_buffer_dirty(trans, bctl->m);
+	btrfs_tree_unlock(bctl->m);
+
+	ret = btrfs_del_ptr(trans, root, path, level + 1, bctl->pslot);
+	if (ret < 0) {
+		free_extent_buffer_stale(bctl->m);
+		bctl->m = NULL;
+		return ret;
+	}
+
+	root_sub_used_bytes(root);
+	ret = btrfs_free_tree_block(trans, btrfs_root_id(root), bctl->m, 0, 1);
+	free_extent_buffer_stale(bctl->m);
+	bctl->m = NULL;
+	if (unlikely(ret < 0)) {
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	/*
+	 * Path fixup logic:
+	 * If we merged to the left, we need to check if the original slot
+	 * now falls within the left node.
+	 */
+	if (bctl->l) {
+		if (btrfs_header_nritems(bctl->l) > orig_slot) {
+			path->nodes[level] = bctl->l;
 			path->slots[level + 1] -= 1;
 			path->slots[level] = orig_slot;
-			/* Left is now owned by path. */
-			left = NULL;
-			if (mid) {
-				btrfs_tree_unlock(mid);
-				free_extent_buffer(mid);
-			}
+			bctl->l = NULL; /* Ownership transferred to path */
 		} else {
-			orig_slot -= btrfs_header_nritems(left);
-			path->slots[level] = orig_slot;
+			ASSERT(bctl->r);
+			path->nodes[level] = bctl->r;
+			path->slots[level] = orig_slot - btrfs_header_nritems(bctl->l);
+			bctl->r = NULL;
 		}
+	} else {
+		/*
+		 * We push all the items from middle to right.
+		 * TODO: why the path->slots[level] is not touched
+		 */
+		path->nodes[level] = bctl->r;
+		bctl->r = NULL;
 	}
-	/* double check we haven't messed things up */
-	if (orig_ptr !=
-	    btrfs_node_blockptr(path->nodes[level], path->slots[level]))
-		BUG();
+
+	return 0;
+}
+
+/*
+ * Try to balance (distribute) items between nodes when a full merge isn't possible.
+ * This moves items from a populated neighbor to the sparse middle node.
+ */
+static int try_distribute_nodes(struct btrfs_trans_handle *trans,
+				struct btrfs_root *root,
+				struct btrfs_path *path,
+				int level,
+				struct node_balance_ctl *bctl,
+				int orig_slot)
+{
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	int ret;
+	int wret;
+	u32 l_nr = bctl->l ? btrfs_header_nritems(bctl->l) : 0;
+	u32 r_nr = bctl->r ? btrfs_header_nritems(bctl->r) : 0;
+	u32 m_nr = btrfs_header_nritems(bctl->m);
+
+	if (max(l_nr, r_nr) <= node_balance_lomark(fs_info))
+		return 0;
+
+	if (l_nr > r_nr) {
+		/* Left is heavier: push from Left -> Middle */
+		orig_slot += l_nr;
+		ret = btrfs_cow_block(trans, root, bctl->l, bctl->parent,
+				      bctl->pslot - 1, &bctl->l,
+				      BTRFS_NESTING_LEFT_COW);
+		if (ret)
+			return ret;
+
+		wret = node_balance_move_r(trans, bctl->l, bctl->m,
+					   (l_nr - m_nr) / 2);
+		if (wret < 0)
+			return wret;
+
+		ret = update_node_key(trans, bctl->parent, bctl->pslot, bctl->m);
+		if (ret)
+			return ret;
+
+		path->slots[level] = orig_slot - btrfs_header_nritems(bctl->l);
+	} else {
+		/* Right is heavier: push from Right -> Middle */
+		ret = btrfs_cow_block(trans, root, bctl->r, bctl->parent,
+				      bctl->pslot + 1, &bctl->r,
+				      BTRFS_NESTING_RIGHT_COW);
+		if (ret)
+			return ret;
+
+		wret = node_balance_move_l(trans, bctl->m, bctl->r,
+					   (r_nr - m_nr) / 2);
+		if (wret < 0)
+			return wret;
+
+		ret = update_node_key(trans, bctl->parent, bctl->pslot + 1, bctl->r);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Node level balancing, used to make sure nodes are in proper order for
+ * item deletion. We balance from the top down, so we have to make sure
+ * that a deletion won't leave a node completely empty later on.
+ */
+static noinline int balance_level(struct btrfs_trans_handle *trans,
+				  struct btrfs_root *root,
+				  struct btrfs_path *path, int level)
+{
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct node_balance_ctl bctl = { 0 };
+	struct extent_buffer *m = path->nodes[level];
+	int ret = 0;
+	int sib_count;
+	int orig_slot = path->slots[level];
+	u64 orig_ptr;
+	u32 l_nr;
+	u32 m_nr;
+	u32 r_nr;
+	u32 total_nr;
+
+	ASSERT(level > 0);
+	WARN_ON(path->locks[level] != BTRFS_WRITE_LOCK);
+	WARN_ON(btrfs_header_generation(m) != trans->transid);
+
+	orig_ptr = btrfs_node_blockptr(m, orig_slot);
+
+	/*
+	 * 1. Acquire and lock siblings.
+	 * This also handles checking if we are at the max level or root.
+	 */
+	sib_count = get_locked_siblings(path, level, &bctl);
+	if (sib_count < 0)
+		return sib_count; /* bctl is empty, no cleanup needed */
+
+	/*
+	 * Root handling:
+	 * If get_locked_siblings returns 0 and parent is NULL, we are at the root.
+	 * If there is only one pointer in the root, promote the child to root.
+	 */
+	if (!bctl.parent) {
+		if (btrfs_header_nritems(m) != 1)
+			return 0;
+		return promote_child_to_root(trans, root, path, level, m);
+	}
+
+	if (sib_count == 0)
+		return 0;
+
+	/* 2. Decision: Merge vs. Distribute */
+	l_nr = bctl.l ? btrfs_header_nritems(bctl.l) : 0;
+	r_nr = bctl.r ? btrfs_header_nritems(bctl.r) : 0;
+	m_nr = btrfs_header_nritems(bctl.m);
+	total_nr = l_nr + m_nr + r_nr;
+
+	if (total_nr <= node_balance_himark(fs_info) * sib_count)
+		ret = try_merge_nodes(trans, root, path, level, &bctl, orig_slot);
+	else
+		ret = try_distribute_nodes(trans, root, path, level, &bctl, orig_slot);
+
+	if (ret)
+		goto out;
+
+	/*
+	 * 3. Integrity check.
+	 * Ensure the original slot still points to the same block pointer.
+	 */
+	if (unlikely(orig_ptr !=
+		     btrfs_node_blockptr(path->nodes[level], path->slots[level]))) {
+		btrfs_crit(fs_info,
+			"path integrity failed: level %d slot %d orig_ptr %llu",
+			level, path->slots[level], orig_ptr);
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+	}
+
 out:
-	if (right) {
-		btrfs_tree_unlock(right);
-		free_extent_buffer(right);
-	}
-	if (left) {
-		btrfs_tree_unlock(left);
-		free_extent_buffer(left);
-	}
+	free_balance_control(&bctl);
 	return ret;
 }
 
