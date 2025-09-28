@@ -38,6 +38,14 @@ static int push_node_left(struct btrfs_trans_handle *trans,
 static int balance_node_right(struct btrfs_trans_handle *trans,
 			      struct extent_buffer *dst_buf,
 			      struct extent_buffer *src_buf);
+static int node_balance_move_l(struct btrfs_trans_handle *trans,
+			       struct extent_buffer *l,
+			       struct extent_buffer *r,
+			       int npush);
+static int node_balance_move_r(struct btrfs_trans_handle *trans,
+			       struct extent_buffer *l,
+			       struct extent_buffer *r,
+			       int npush);
 
 /*
  * Defines the high watermark threshold for node rebalancing.
@@ -2670,6 +2678,104 @@ static bool check_sibling_keys(const struct extent_buffer *left,
 	return false;
 }
 
+static int node_balance_move_l(struct btrfs_trans_handle *trans,
+			       struct extent_buffer *l,
+			       struct extent_buffer *r,
+			       int npush)
+{
+	int l_nr = btrfs_header_nritems(l);
+	int r_nr = btrfs_header_nritems(r);
+	int ret = 0;
+
+	WARN_ON(btrfs_header_generation(l) != trans->transid);
+	WARN_ON(btrfs_header_generation(r) != trans->transid);
+
+	if (npush <= 0)
+		return 1;
+
+	npush = min(npush, r_nr);
+
+	if (unlikely(check_sibling_keys(l, r))) {
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	ret = btrfs_tree_mod_log_eb_copy(l, r, l_nr, 0, npush);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	copy_extent_buffer(l, r, btrfs_node_key_ptr_offset(l, l_nr),
+				 btrfs_node_key_ptr_offset(r, 0),
+				 npush * sizeof(struct btrfs_key_ptr));
+
+	if (npush < r_nr) {
+		/*
+		 * btrfs_tree_mod_log_eb_copy handles logging the move, so we
+		 * don't need to do an explicit tree mod log operation for it.
+		 */
+		memmove_extent_buffer(r, btrfs_node_key_ptr_offset(r, 0),
+					 btrfs_node_key_ptr_offset(r, npush),
+					 (r_nr - npush) * sizeof(struct btrfs_key_ptr));
+	}
+
+	btrfs_set_header_nritems(r, r_nr - npush);
+	btrfs_set_header_nritems(l, l_nr + npush);
+	btrfs_mark_buffer_dirty(trans, l);
+	btrfs_mark_buffer_dirty(trans, r);
+
+	return ret;
+}
+
+static int node_balance_move_r(struct btrfs_trans_handle *trans,
+			       struct extent_buffer *l,
+			       struct extent_buffer *r,
+			       int npush)
+{
+	int l_nr = btrfs_header_nritems(l);
+	int r_nr = btrfs_header_nritems(r);
+	int ret = 0;
+
+	WARN_ON(btrfs_header_generation(l) != trans->transid);
+	WARN_ON(btrfs_header_generation(r) != trans->transid);
+
+	if (npush <= 0)
+		return 1;
+
+	npush = min(npush, l_nr);
+
+	if (unlikely(check_sibling_keys(l, r))) {
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	memmove_extent_buffer(r, btrfs_node_key_ptr_offset(r, npush),
+				 btrfs_node_key_ptr_offset(r, 0),
+				 r_nr * sizeof(struct btrfs_key_ptr));
+	/*
+	 * btrfs_tree_mod_log_eb_copy handles logging the move, so we don't
+	 * need to do an explicit tree mod log operation for it.
+	 */
+	ret = btrfs_tree_mod_log_eb_copy(r, l, 0, l_nr - npush, npush);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		return ret;
+	}
+
+	copy_extent_buffer(r, l, btrfs_node_key_ptr_offset(r, 0),
+				 btrfs_node_key_ptr_offset(l, l_nr - npush),
+				 npush * sizeof(struct btrfs_key_ptr));
+
+	btrfs_set_header_nritems(r, r_nr + npush);
+	btrfs_set_header_nritems(l, l_nr - npush);
+	btrfs_mark_buffer_dirty(trans, l);
+	btrfs_mark_buffer_dirty(trans, r);
+
+	return ret;
+}
 /*
  * try to push data from one node into the next node left in the
  * tree.
