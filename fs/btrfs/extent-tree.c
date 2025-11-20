@@ -5442,19 +5442,20 @@ out_unuse:
 struct walk_control {
 	u64 refs[BTRFS_MAX_LEVEL];
 	u64 flags[BTRFS_MAX_LEVEL];
+	u32 reada_slot;
+	u32 reada_count;
 	struct btrfs_key update_progress;
 	struct btrfs_key drop_progress;
-	int drop_level;
-	int stage;
-	int level;
-	int shared_level;
-	int update_ref;
-	int keep_locks;
-	int reada_slot;
-	int reada_count;
-	int restarted;
+	s8 drop_level;
+	// shared_level may be -1 and level is used to compare with shared_level
+	s8 level;
+	s8 shared_level;
+	u8 stage;
+	bool update_ref:1;
+	bool keep_locks:1;
+	bool restarted:1;
 	/* Indicate that extent info needs to be looked up when walking the tree. */
-	int lookup_info;
+	bool lookup_info:1;
 };
 
 /*
@@ -5809,7 +5810,7 @@ static int check_next_block_uptodate(struct btrfs_trans_handle *trans,
 		return ret;
 	}
 	btrfs_tree_lock(next);
-	wc->lookup_info = 1;
+	wc->lookup_info = true;
 	return 0;
 }
 
@@ -5863,7 +5864,7 @@ static int maybe_drop_reference(struct btrfs_trans_handle *trans, struct btrfs_r
 		if (ret <= 0)
 			return ret;
 		ret = 0;
-		wc->restarted = 0;
+		wc->restarted = false;
 	}
 
 	/*
@@ -5933,7 +5934,7 @@ static noinline int do_walk_down(struct btrfs_trans_handle *trans,
 	 */
 	if (wc->stage == UPDATE_BACKREF &&
 	    generation <= btrfs_root_origin_generation(root)) {
-		wc->lookup_info = 1;
+		wc->lookup_info = true;
 		return 1;
 	}
 
@@ -5959,7 +5960,7 @@ static noinline int do_walk_down(struct btrfs_trans_handle *trans,
 		ret = -EUCLEAN;
 		goto out_unlock;
 	}
-	wc->lookup_info = 0;
+	wc->lookup_info = false;
 
 	/* If we don't have to walk into this node skip it. */
 	if (!visit_node_for_delete(root, wc, path->nodes[level],
@@ -6000,7 +6001,7 @@ skip:
 		goto out_unlock;
 	wc->refs[level - 1] = 0;
 	wc->flags[level - 1] = 0;
-	wc->lookup_info = 1;
+	wc->lookup_info = true;
 	ret = 1;
 
 out_unlock:
@@ -6040,7 +6041,7 @@ static noinline int walk_up_proc(struct btrfs_trans_handle *trans,
 
 		ret = find_next_key(path, level + 1, &wc->update_progress);
 		if (ret > 0)
-			wc->update_ref = 0;
+			wc->update_ref = false;
 
 		wc->stage = DROP_REFERENCE;
 		wc->shared_level = -1;
@@ -6166,7 +6167,7 @@ static noinline int walk_down_tree(struct btrfs_trans_handle *trans,
 	int level = wc->level;
 	int ret = 0;
 
-	wc->lookup_info = 1;
+	wc->lookup_info = true;
 	while (level >= 0) {
 		ret = walk_down_proc(trans, root, path, wc);
 		if (ret)
@@ -6377,7 +6378,7 @@ int btrfs_drop_snapshot(struct btrfs_root *root, bool for_reloc)
 	wc->shared_level = -1;
 	wc->stage = DROP_REFERENCE;
 	wc->update_ref = update_ref;
-	wc->keep_locks = 0;
+	wc->keep_locks = false;
 	wc->reada_count = BTRFS_NODEPTRS_PER_BLOCK(fs_info);
 
 	while (1) {
@@ -6568,8 +6569,8 @@ int btrfs_drop_subtree(struct btrfs_trans_handle *trans,
 	wc->level = level;
 	wc->shared_level = -1;
 	wc->stage = DROP_REFERENCE;
-	wc->update_ref = 0;
-	wc->keep_locks = 1;
+	wc->update_ref = false;
+	wc->keep_locks = true;
 	wc->reada_count = BTRFS_NODEPTRS_PER_BLOCK(fs_info);
 
 	while (1) {
