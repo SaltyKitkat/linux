@@ -1586,7 +1586,7 @@ static int clean_dirty_subvols(struct reloc_control *rc)
 				 * ->reloc_root.  If it fails however we must
 				 * drop the ref ourselves.
 				 */
-				ret2 = btrfs_drop_snapshot(reloc_root, false, true);
+				ret2 = btrfs_drop_snapshot(reloc_root, true);
 				if (ret2 < 0) {
 					btrfs_put_root(reloc_root);
 					if (!ret)
@@ -1596,7 +1596,7 @@ static int clean_dirty_subvols(struct reloc_control *rc)
 			btrfs_put_root(root);
 		} else {
 			/* Orphan reloc tree, just clean it up */
-			ret2 = btrfs_drop_snapshot(root, false, true);
+			ret2 = btrfs_drop_snapshot(root, true);
 			if (ret2 < 0) {
 				btrfs_put_root(root);
 				if (!ret)
