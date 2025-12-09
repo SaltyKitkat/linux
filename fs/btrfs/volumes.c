@@ -8694,18 +8694,12 @@ int btrfs_verify_dev_extents(struct btrfs_fs_info *fs_info)
 		return -ENOMEM;
 
 	path->reada = READA_FORWARD_ALWAYS;
-	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	ret = btrfs_search_slot_for_read(root, &key, path, true);
 	if (ret < 0)
 		return ret;
+	if (unlikely(ret > 0))
+		return -EUCLEAN;
 
-	if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
-		ret = btrfs_next_leaf(root, path);
-		if (ret < 0)
-			return ret;
-		/* No dev extents at all? Not good */
-		if (unlikely(ret > 0))
-			return -EUCLEAN;
-	}
 	while (1) {
 		struct extent_buffer *leaf = path->nodes[0];
 		struct btrfs_dev_extent *dext;
