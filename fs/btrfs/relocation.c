@@ -3484,9 +3484,8 @@ int find_next_extent(struct reloc_control *rc, struct btrfs_path *path,
 
 		path->search_commit_root = true;
 		path->skip_locking = true;
-		ret = btrfs_search_slot(NULL, rc->extent_root, &key, path,
-					0, 0);
-		if (ret < 0)
+		ret = btrfs_search_slot_for_read(rc->extent_root, &key, path, true);
+		if (ret)
 			break;
 next:
 		leaf = path->nodes[0];
@@ -5641,15 +5640,11 @@ int btrfs_recover_relocation(struct btrfs_fs_info *fs_info)
 	key.offset = (u64)-1;
 
 	while (1) {
-		ret = btrfs_search_slot(NULL, fs_info->tree_root, &key,
-					path, 0, 0);
+		ret = btrfs_search_slot_for_read(fs_info->tree_root, &key, path, false);
 		if (ret < 0)
 			goto out;
-		if (ret > 0) {
-			if (path->slots[0] == 0)
-				break;
-			path->slots[0]--;
-		}
+		if (ret > 0)
+			break;
 		ret = 0;
 		leaf = path->nodes[0];
 		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);

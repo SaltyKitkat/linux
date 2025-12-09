@@ -440,13 +440,9 @@ int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
 		path->search_commit_root = true;
 	}
 
-	ret = btrfs_search_slot(NULL, stripe_root, &stripe_key, path, 0, 0);
+	ret = btrfs_search_slot_for_read(stripe_root, &stripe_key, path, false);
 	if (ret < 0)
 		return ret;
-	if (ret) {
-		if (path->slots[0] != 0)
-			path->slots[0]--;
-	}
 
 	while (1) {
 		leaf = path->nodes[0];
