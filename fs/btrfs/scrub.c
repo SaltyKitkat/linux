@@ -2649,22 +2649,12 @@ int scrub_enumerate_chunks(struct scrub_ctx *sctx,
 	while (1) {
 		u64 dev_extent_len;
 
-		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+		ret = btrfs_search_slot_for_read(root, &key, path, true);
 		if (ret < 0)
 			break;
 		if (ret > 0) {
-			if (path->slots[0] >=
-			    btrfs_header_nritems(path->nodes[0])) {
-				ret = btrfs_next_leaf(root, path);
-				if (ret < 0)
-					break;
-				if (ret > 0) {
-					ret = 0;
-					break;
-				}
-			} else {
-				ret = 0;
-			}
+			ret = 0;
+			break;
 		}
 
 		l = path->nodes[0];
