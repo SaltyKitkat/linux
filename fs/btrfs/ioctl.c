@@ -1853,7 +1853,7 @@ static int btrfs_search_path_in_tree_user(struct mnt_idmap *idmap,
 	ret = btrfs_search_slot(NULL, fs_info->tree_root, &key, path, 0, 0);
 	if (ret < 0)
 		return ret;
-	else if (ret > 0)
+	if (ret > 0)
 		return -ENOENT;
 
 	leaf = path->nodes[0];
@@ -2027,18 +2027,12 @@ static int _btrfs_ioctl_get_subvol_info(struct inode *inode,
 		/* Search root tree for ROOT_BACKREF of this subvolume */
 		key.type = BTRFS_ROOT_BACKREF_KEY;
 		key.offset = 0;
-		ret = btrfs_search_slot(NULL, fs_info->tree_root, &key, path, 0, 0);
-		if (ret < 0) {
+		ret = btrfs_search_slot_for_read(fs_info->tree_root, &key, path, true);
+		if (ret < 0)
 			goto out;
-		} else if (path->slots[0] >=
-			   btrfs_header_nritems(path->nodes[0])) {
-			ret = btrfs_next_leaf(fs_info->tree_root, path);
-			if (ret < 0) {
-				goto out;
-			} else if (unlikely(ret > 0)) {
-				ret = -EUCLEAN;
-				goto out;
-			}
+		if (unlikely(ret > 0)) {
+			ret = -EUCLEAN;
+			goto out;
 		}
 
 		leaf = path->nodes[0];
@@ -2169,18 +2163,12 @@ static int btrfs_ioctl_get_subvol_rootref(struct btrfs_root *root,
 	found = 0;
 
 	root = root->fs_info->tree_root;
-	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
-	if (ret < 0) {
+	ret = btrfs_search_slot_for_read(root, &key, path, true);
+	if (ret < 0)
 		goto out;
-	} else if (path->slots[0] >=
-		   btrfs_header_nritems(path->nodes[0])) {
-		ret = btrfs_next_leaf(root, path);
-		if (ret < 0) {
-			goto out;
-		} else if (unlikely(ret > 0)) {
-			ret = -EUCLEAN;
-			goto out;
-		}
+	if (unlikely(ret > 0)) {
+		ret = -EUCLEAN;
+		goto out;
 	}
 	while (1) {
 		leaf = path->nodes[0];
