@@ -3158,18 +3158,12 @@ static int can_rmdir(struct send_ctx *sctx, u64 dir, u64 dir_gen)
 		key.type = BTRFS_DIR_INDEX_KEY;
 		key.offset = (u64)-1;
 
-		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+		ret = btrfs_search_slot_for_read(root, &key, path, false);
 		if (ret < 0) {
 			goto out;
-		} else if (ret > 0) {
-			/* Can't happen, the root is never empty. */
-			ASSERT(path->slots[0] > 0);
-			if (WARN_ON(path->slots[0] == 0)) {
-				ret = -EUCLEAN;
-				goto out;
-			}
-			path->slots[0]--;
 		}
+		/* Root is never empty. */
+		ASSERT(ret == 0);
 
 		btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
 		if (key.objectid != dir || key.type != BTRFS_DIR_INDEX_KEY) {
@@ -5846,15 +5840,6 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
 		u64 clone_data_offset;
 		bool crossed_src_i_size = false;
 
-		if (slot >= btrfs_header_nritems(leaf)) {
-			ret = btrfs_next_leaf(clone_root->root, path);
-			if (ret < 0)
-				return ret;
-			else if (ret > 0)
-				break;
-			continue;
-		}
-
 		btrfs_item_key_to_cpu(leaf, &key, slot);
 
 		/*
@@ -6015,7 +6000,11 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
 
 		data_offset += clone_len;
 next:
-		path->slots[0]++;
+		ret = btrfs_next_item(clone_root->root, path);
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			break;
 	}
 
 	if (len > 0)
@@ -6320,26 +6309,15 @@ static int range_is_hole_in_parent(struct send_ctx *sctx,
 	key.objectid = sctx->cur_ino;
 	key.type = BTRFS_EXTENT_DATA_KEY;
 	key.offset = search_start;
-	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	ret = btrfs_search_slot_for_read(root, &key, path, false);
 	if (ret < 0)
 		return ret;
-	if (ret > 0 && path->slots[0] > 0)
-		path->slots[0]--;
 
 	while (search_start < end) {
 		struct extent_buffer *leaf = path->nodes[0];
 		int slot = path->slots[0];
 		struct btrfs_file_extent_item *fi;
 		u64 extent_end;
-
-		if (slot >= btrfs_header_nritems(leaf)) {
-			ret = btrfs_next_leaf(root, path);
-			if (ret < 0)
-				return ret;
-			if (ret > 0)
-				break;
-			continue;
-		}
 
 		btrfs_item_key_to_cpu(leaf, &key, slot);
 		if (key.objectid < sctx->cur_ino ||
@@ -6362,7 +6340,11 @@ static int range_is_hole_in_parent(struct send_ctx *sctx,
 		}
 		return 0;
 next:
-		path->slots[0]++;
+		ret = btrfs_next_item(root, path);
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			break;
 	}
 	return 1;
 }
