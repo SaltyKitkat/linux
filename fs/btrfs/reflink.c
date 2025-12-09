@@ -194,7 +194,8 @@ static int clone_copy_inline_extent(struct btrfs_inode *inode,
 	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
 	if (ret < 0) {
 		return ret;
-	} else if (ret > 0) {
+	}
+	if (ret > 0) {
 		if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
 			ret = btrfs_next_leaf(root, path);
 			if (ret < 0)

@@ -230,19 +230,13 @@ int btrfs_find_orphan_roots(struct btrfs_fs_info *fs_info)
 		u64 root_objectid;
 		int ret;
 
-		ret = btrfs_search_slot(NULL, tree_root, &key, path, 0, 0);
+		ret = btrfs_search_slot_for_read(tree_root, &key, path, true);
 		if (ret < 0)
 			return ret;
+		if (ret)
+			return 0;
 
 		leaf = path->nodes[0];
-		if (path->slots[0] >= btrfs_header_nritems(leaf)) {
-			ret = btrfs_next_leaf(tree_root, path);
-			if (ret < 0)
-				return ret;
-			else if (ret > 0)
-				return 0;
-			leaf = path->nodes[0];
-		}
 
 		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
 		btrfs_release_path(path);
