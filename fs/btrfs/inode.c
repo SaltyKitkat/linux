@@ -3746,20 +3746,12 @@ int btrfs_orphan_cleanup(struct btrfs_root *root)
 	while (1) {
 		struct btrfs_inode *inode;
 
-		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+		ret = btrfs_search_slot_for_read(root, &key, path, false);
 		if (ret < 0)
 			goto out;
-
-		/*
-		 * if ret == 0 means we found what we were searching for, which
-		 * is weird, but possible, so only screw with path if we didn't
-		 * find the key and see if we have stuff that matches
-		 */
 		if (ret > 0) {
 			ret = 0;
-			if (path->slots[0] == 0)
-				break;
-			path->slots[0]--;
+			break;
 		}
 
 		/* pull out the item */

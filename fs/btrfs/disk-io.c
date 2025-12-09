@@ -2098,19 +2098,12 @@ static int load_global_roots_objectid(struct btrfs_root *tree_root,
 	}
 
 	while (1) {
-		ret = btrfs_search_slot(NULL, tree_root, &key, path, 0, 0);
-		if (ret < 0)
+		ret = btrfs_search_slot_for_read(tree_root, &key, path, true);
+		if (ret) {
+			if (ret > 0)
+				ret = 0;
 			break;
-
-		if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
-			ret = btrfs_next_leaf(tree_root, path);
-			if (ret) {
-				if (ret > 0)
-					ret = 0;
-				break;
-			}
 		}
-		ret = 0;
 
 		btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
 		if (key.objectid != objectid)
