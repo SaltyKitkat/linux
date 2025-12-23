@@ -317,6 +317,11 @@ static int create_space_info(struct btrfs_fs_info *info, u64 flags)
 
 		if (ret)
 			goto out_free;
+	} else {
+		if ((flags & BTRFS_BLOCK_GROUP_DATA) &&
+		    !(flags & BTRFS_BLOCK_GROUP_METADATA)) {
+			space_info->bg_reclaim_threshold = 10;
+		}
 	}
 
 	ret = btrfs_sysfs_add_space_info_type(space_info);
