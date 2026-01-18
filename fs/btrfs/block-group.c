@@ -1918,8 +1918,7 @@ static inline bool btrfs_should_reclaim(const struct btrfs_fs_info *fs_info)
 
 static bool should_reclaim_block_group(const struct btrfs_block_group *bg, u64 bytes_freed)
 {
-	const int thresh_pct = btrfs_calc_reclaim_threshold(bg->space_info);
-	u64 thresh_bytes = mult_perc(bg->length, thresh_pct);
+	u64 thresh_bytes = btrfs_calc_reclaim_threshold_bytes(bg->space_info);
 	const u64 new_val = bg->used;
 	const u64 old_val = new_val + bytes_freed;
 
