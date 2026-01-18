@@ -2137,27 +2137,36 @@ static bool is_reclaim_urgent(struct btrfs_space_info *space_info)
 	return unalloc < data_chunk_size;
 }
 
+u64 btrfs_calc_reclaim_threshold_bytes(struct btrfs_space_info *space_info)
+{
+	u64 data_chunk_size = calc_effective_data_chunk_size(space_info->fs_info);
+	int thresh_pct = btrfs_calc_reclaim_threshold(space_info);
+	return mult_perc(data_chunk_size, thresh_pct);
+}
+
 static bool do_reclaim_sweep(struct btrfs_space_info *space_info, int raid)
 {
 	struct btrfs_block_group *bg;
 	int thresh_pct;
+	u64 data_chunk_size;
+	u64 thresh;
 	bool will_reclaim = false;
 	bool urgent;
 
+	data_chunk_size = calc_effective_data_chunk_size(space_info->fs_info);
 	spin_lock(&space_info->lock);
 	urgent = is_reclaim_urgent(space_info);
 	thresh_pct = btrfs_calc_reclaim_threshold(space_info);
 	spin_unlock(&space_info->lock);
+	thresh = mult_perc(data_chunk_size, thresh_pct);
 
 	down_read(&space_info->groups_sem);
 again:
 	list_for_each_entry(bg, &space_info->block_groups[raid], list) {
-		u64 thresh;
 		bool reclaim = false;
 
 		btrfs_get_block_group(bg);
 		spin_lock(&bg->lock);
-		thresh = mult_perc(bg->length, thresh_pct);
 		if (bg->used < thresh && bg->reclaim_mark) {
 			will_reclaim = true;
 			reclaim = true;
