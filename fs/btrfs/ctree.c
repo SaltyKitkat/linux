@@ -4582,6 +4582,70 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
 
 	return ret;
 }
+static int balance_leaf(struct btrfs_trans_handle *trans,
+			struct btrfs_root *root,
+			struct btrfs_path *path)
+{
+	struct extent_buffer *leaf = path->nodes[0];
+	int ret = 0;
+	int wret;
+	int slot;
+	u32 min_push_space;
+	u32 nritems;
+
+	/* push_leaf_left fixes the path.
+	 * make sure the path still points to our leaf
+	 * for possible call to btrfs_del_ptr below
+	 */
+	slot = path->slots[1];
+	refcount_inc(&leaf->refs);
+
+	/*
+	 * We want to be able to at least push one item to the
+	 * left neighbour leaf, and that's the first item.
+	 */
+	min_push_space = sizeof(struct btrfs_item) + btrfs_item_size(leaf, 0);
+	wret = push_leaf_left(trans, root, path, 0, min_push_space, 1, (u32)-1);
+
+	if (wret < 0 && wret != -ENOSPC)
+		ret = wret;
+
+	if (path->nodes[0] == leaf && btrfs_header_nritems(leaf)) {
+		/*
+		 * If we were not able to push all items from our
+		 * leaf to its left neighbour, then attempt to
+		 * either push all the remaining items to the
+		 * right neighbour or none. There's no advantage
+		 * in pushing only some items, instead of all, as
+		 * it's pointless to end up with a leaf having
+		 * too few items while the neighbours can be full
+		 * or nearly full.
+		 */
+		nritems = btrfs_header_nritems(leaf);
+		min_push_space = leaf_space_used(leaf, 0, nritems);
+		wret = push_leaf_right(trans, root, path, 0, min_push_space, 1, 0);
+		if (wret < 0 && wret != -ENOSPC)
+			ret = wret;
+	}
+
+	if (btrfs_header_nritems(leaf) == 0) {
+		path->slots[1] = slot;
+		ret = btrfs_del_leaf(trans, root, path, leaf);
+		free_extent_buffer(leaf);
+		if (ret < 0)
+			return ret;
+	} else {
+		/* if we're still in the path, make sure
+		 * we're dirty.  Otherwise, one of the
+		 * push_leaf functions must have already
+		 * dirtied this buffer
+		 */
+		if (path->nodes[0] == leaf)
+			btrfs_mark_buffer_dirty(trans, leaf);
+		free_extent_buffer(leaf);
+	}
+	return ret;
+}
 /*
  * delete the item at the leaf level in path.  If that empties
  * the leaf, remove it from the tree
@@ -4592,7 +4656,6 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct extent_buffer *leaf;
 	int ret = 0;
-	int wret;
 	u32 nritems;
 
 	leaf = path->nodes[0];
@@ -4647,65 +4710,10 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		 * items, or items from other leaves might be moved later into our
 		 * leaf due to deletions on those leaves.
 		 */
-		if (used < BTRFS_LEAF_DATA_SIZE(fs_info) / 3) {
-			u32 min_push_space;
-
-			/* push_leaf_left fixes the path.
-			 * make sure the path still points to our leaf
-			 * for possible call to btrfs_del_ptr below
-			 */
-			slot = path->slots[1];
-			refcount_inc(&leaf->refs);
-			/*
-			 * We want to be able to at least push one item to the
-			 * left neighbour leaf, and that's the first item.
-			 */
-			min_push_space = sizeof(struct btrfs_item) +
-				btrfs_item_size(leaf, 0);
-			wret = push_leaf_left(trans, root, path, 0,
-					      min_push_space, 1, (u32)-1);
-			if (wret < 0 && wret != -ENOSPC)
-				ret = wret;
-
-			if (path->nodes[0] == leaf &&
-			    btrfs_header_nritems(leaf)) {
-				/*
-				 * If we were not able to push all items from our
-				 * leaf to its left neighbour, then attempt to
-				 * either push all the remaining items to the
-				 * right neighbour or none. There's no advantage
-				 * in pushing only some items, instead of all, as
-				 * it's pointless to end up with a leaf having
-				 * too few items while the neighbours can be full
-				 * or nearly full.
-				 */
-				nritems = btrfs_header_nritems(leaf);
-				min_push_space = leaf_space_used(leaf, 0, nritems);
-				wret = push_leaf_right(trans, root, path, 0,
-						       min_push_space, 1, 0);
-				if (wret < 0 && wret != -ENOSPC)
-					ret = wret;
-			}
-
-			if (btrfs_header_nritems(leaf) == 0) {
-				path->slots[1] = slot;
-				ret = btrfs_del_leaf(trans, root, path, leaf);
-				free_extent_buffer(leaf);
-				if (ret < 0)
-					return ret;
-			} else {
-				/* if we're still in the path, make sure
-				 * we're dirty.  Otherwise, one of the
-				 * push_leaf functions must have already
-				 * dirtied this buffer
-				 */
-				if (path->nodes[0] == leaf)
-					btrfs_mark_buffer_dirty(trans, leaf);
-				free_extent_buffer(leaf);
-			}
-		} else {
+		if (used < BTRFS_LEAF_DATA_SIZE(fs_info) / 3)
+			return balance_leaf(trans, root, path);
+		else
 			btrfs_mark_buffer_dirty(trans, leaf);
-		}
 	}
 	return ret;
 }
