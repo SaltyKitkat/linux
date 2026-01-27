@@ -4728,7 +4728,7 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		 * items, or items from other leaves might be moved later into our
 		 * leaf due to deletions on those leaves.
 		 */
-		if (used < BTRFS_LEAF_DATA_SIZE(fs_info) / 3)
+		if (leaf != root->node && used < BTRFS_LEAF_DATA_SIZE(fs_info) / 3)
 			return balance_leaf(trans, root, path);
 		else
 			btrfs_mark_buffer_dirty(trans, leaf);
