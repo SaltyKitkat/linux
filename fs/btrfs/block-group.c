@@ -4528,38 +4528,35 @@ static void reserve_chunk_space(struct btrfs_trans_handle *trans,
 		 * or created in the current transaction for example).
 		 */
 		bg = btrfs_create_chunk(trans, space_info, flags);
-		if (IS_ERR(bg)) {
-			ret = PTR_ERR(bg);
-		} else {
-			/*
-			 * We have a new chunk. We also need to activate it for
-			 * zoned filesystem.
-			 */
-			ret = btrfs_zoned_activate_one_bg(info, true);
-			if (ret < 0)
-				return;
+		if (IS_ERR(bg))
+			return;
 
-			/*
-			 * If we fail to add the chunk item here, we end up
-			 * trying again at phase 2 of chunk allocation, at
-			 * btrfs_create_pending_block_groups(). So ignore
-			 * any error here. An ENOSPC here could happen, due to
-			 * the cases described at do_chunk_alloc() - the system
-			 * block group we just created was just turned into RO
-			 * mode by a scrub for example, or a running discard
-			 * temporarily removed its free space entries, etc.
-			 */
-			btrfs_chunk_alloc_add_chunk_item(trans, bg);
-		}
+		/*
+		 * We have a new chunk. We also need to activate it for
+		 * zoned filesystem.
+		 */
+		ret = btrfs_zoned_activate_one_bg(info, true);
+		if (ret < 0)
+			return;
+
+		/*
+		 * If we fail to add the chunk item here, we end up
+		 * trying again at phase 2 of chunk allocation, at
+		 * btrfs_create_pending_block_groups(). So ignore
+		 * any error here. An ENOSPC here could happen, due to
+		 * the cases described at do_chunk_alloc() - the system
+		 * block group we just created was just turned into RO
+		 * mode by a scrub for example, or a running discard
+		 * temporarily removed its free space entries, etc.
+		 */
+		btrfs_chunk_alloc_add_chunk_item(trans, bg);
 	}
 
-	if (!ret) {
-		ret = btrfs_block_rsv_add(fs_info,
-					  &fs_info->chunk_block_rsv,
-					  bytes, BTRFS_RESERVE_NO_FLUSH);
-		if (!ret)
-			trans->chunk_bytes_reserved += bytes;
-	}
+	ret = btrfs_block_rsv_add(fs_info,
+				  &fs_info->chunk_block_rsv,
+				  bytes, BTRFS_RESERVE_NO_FLUSH);
+	if (!ret)
+		trans->chunk_bytes_reserved += bytes;
 }
 
 /*
