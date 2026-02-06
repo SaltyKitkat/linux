@@ -85,7 +85,7 @@ void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info, int nr_refs, 
  * or trans->delayed_ref_csum_deletions, it'll calculate the additional size and
  * add it to the delayed_refs_rsv.
  */
-void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans)
+static void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans)
 {
 	struct btrfs_fs_info *fs_info = trans->fs_info;
 	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_refs_rsv;
