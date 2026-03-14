@@ -396,7 +396,6 @@ static bool btrfs_delayed_ref_lock(struct btrfs_delayed_ref_root *delayed_refs,
 }
 
 static inline void drop_delayed_ref(struct btrfs_fs_info *fs_info,
-				    struct btrfs_delayed_ref_root *delayed_refs,
 				    struct btrfs_delayed_ref_head *head,
 				    struct btrfs_delayed_ref_node *ref)
 {
@@ -439,10 +438,10 @@ static bool merge_ref(struct btrfs_fs_info *fs_info,
 			mod = -next->ref_mod;
 		}
 
-		drop_delayed_ref(fs_info, delayed_refs, head, next);
+		drop_delayed_ref(fs_info, head, next);
 		ref->ref_mod += mod;
 		if (ref->ref_mod == 0) {
-			drop_delayed_ref(fs_info, delayed_refs, head, ref);
+			drop_delayed_ref(fs_info, head, ref);
 			done = true;
 		} else {
 			/*
@@ -653,7 +652,7 @@ static bool insert_delayed_ref(struct btrfs_trans_handle *trans,
 
 	/* remove existing tail if its ref_mod is zero */
 	if (exist->ref_mod == 0)
-		drop_delayed_ref(trans->fs_info, root, href, exist);
+		drop_delayed_ref(trans->fs_info, href, exist);
 	spin_unlock(&href->lock);
 	return true;
 }
@@ -1324,7 +1323,7 @@ void btrfs_destroy_delayed_refs(struct btrfs_transaction *trans)
 			struct btrfs_delayed_ref_node *ref;
 
 			ref = rb_entry(n, struct btrfs_delayed_ref_node, ref_node);
-			drop_delayed_ref(fs_info, delayed_refs, head, ref);
+			drop_delayed_ref(fs_info, head, ref);
 		}
 		if (head->must_insert_reserved)
 			pin_bytes = true;
