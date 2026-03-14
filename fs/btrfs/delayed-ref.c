@@ -409,7 +409,6 @@ static inline void drop_delayed_ref(struct btrfs_fs_info *fs_info,
 }
 
 static bool merge_ref(struct btrfs_fs_info *fs_info,
-		      struct btrfs_delayed_ref_root *delayed_refs,
 		      struct btrfs_delayed_ref_head *head,
 		      struct btrfs_delayed_ref_node *ref,
 		      u64 seq)
@@ -456,7 +455,6 @@ static bool merge_ref(struct btrfs_fs_info *fs_info,
 }
 
 void btrfs_merge_delayed_refs(struct btrfs_fs_info *fs_info,
-			      struct btrfs_delayed_ref_root *delayed_refs,
 			      struct btrfs_delayed_ref_head *head)
 {
 	struct btrfs_delayed_ref_node *ref;
@@ -479,7 +477,7 @@ again:
 		ref = rb_entry(node, struct btrfs_delayed_ref_node, ref_node);
 		if (seq && ref->seq >= seq)
 			continue;
-		if (merge_ref(fs_info, delayed_refs, head, ref, seq))
+		if (merge_ref(fs_info, head, ref, seq))
 			goto again;
 	}
 }
@@ -610,7 +608,6 @@ static bool insert_delayed_ref(struct btrfs_trans_handle *trans,
 			       struct btrfs_delayed_ref_head *href,
 			       struct btrfs_delayed_ref_node *ref)
 {
-	struct btrfs_delayed_ref_root *root = &trans->transaction->delayed_refs;
 	struct btrfs_delayed_ref_node *exist;
 	int mod;
 
