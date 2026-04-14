@@ -1371,10 +1371,10 @@ static void btrfs_preempt_reclaim_metadata_space(struct work_struct *work)
 
 		/*
 		 * We don't want to reclaim everything, just a portion, so scale
-		 * down the to_reclaim by 1/4.  If it takes us down to 0,
+		 * down the to_reclaim by 1/2.  If it takes us down to 0,
 		 * reclaim 1 items worth.
 		 */
-		to_reclaim >>= 2;
+		to_reclaim >>= 1;
 		if (!to_reclaim)
 			to_reclaim = btrfs_calc_insert_metadata_size(fs_info, 1);
 		flush_space(space_info, to_reclaim, flush, true);
