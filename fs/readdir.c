@@ -147,7 +147,7 @@ EXPORT_SYMBOL(iterate_dir);
  * kernel limit on a possible path component, not NAME_MAX,
  * which is the technical standard limit.
  */
-static int verify_dirent_name(const char *name, int len)
+static inline int verify_dirent_name(const char *name, int len)
 {
 	if (len <= 0 || len >= PATH_MAX)
 		return -EIO;
@@ -438,7 +438,7 @@ static bool compat_fillonedir(struct dir_context *ctx, const char *name,
 	if (buf->result)
 		return false;
 	buf->result = verify_dirent_name(name, namlen);
-	if (buf->result)
+	if (unlikely(buf->result))
 		return false;
 	d_ino = ino;
 	if (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {
