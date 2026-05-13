@@ -1364,8 +1364,9 @@ out:
 	return ret;
 }
 
-/* Node balancing for insertion.  Here we only split or push nodes around
- * when they are completely full.  This is also done top down, so we
+/*
+ * Node balancing for insertion. Here we only split or push nodes around
+ * when they are completely full. This is also done top down, so we
  * have to be pessimistic.
  */
 static noinline int push_nodes_for_insert(struct btrfs_trans_handle *trans,
@@ -1373,132 +1374,120 @@ static noinline int push_nodes_for_insert(struct btrfs_trans_handle *trans,
 					  struct btrfs_path *path, int level)
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
-	struct extent_buffer *right = NULL;
-	struct extent_buffer *mid;
-	struct extent_buffer *left = NULL;
-	struct extent_buffer *parent = NULL;
+	struct node_balance_ctl bctl = { 0 };
+	struct extent_buffer *m = path->nodes[level];
 	int ret = 0;
-	int wret;
-	int pslot;
+	int sib_count;
 	int orig_slot = path->slots[level];
+	u64 orig_ptr;
+	u32 l_nr, r_nr;
 
 	if (level == 0)
 		return 1;
 
-	mid = path->nodes[level];
-	WARN_ON(btrfs_header_generation(mid) != trans->transid);
+	WARN_ON(btrfs_header_generation(m) != trans->transid);
+	orig_ptr = btrfs_node_blockptr(m, orig_slot);
 
-	if (level < BTRFS_MAX_LEVEL - 1) {
-		parent = path->nodes[level + 1];
-		pslot = path->slots[level + 1];
-	}
-
-	if (!parent)
-		return 1;
-
-	/* first, try to make some room in the middle buffer */
-	if (pslot) {
-		u32 left_nr;
-
-		left = btrfs_read_node_slot(parent, pslot - 1);
-		if (IS_ERR(left))
-			return PTR_ERR(left);
-
-		btrfs_tree_lock_nested(left, BTRFS_NESTING_LEFT);
-
-		left_nr = btrfs_header_nritems(left);
-		if (left_nr >= BTRFS_NODEPTRS_PER_BLOCK(fs_info) - 1) {
-			wret = 1;
-		} else {
-			ret = btrfs_cow_block(trans, root, left, parent,
-					      pslot - 1, &left,
-					      BTRFS_NESTING_LEFT_COW);
-			if (ret)
-				wret = 1;
-			else {
-				wret = push_node_left(trans, left, mid, 0);
-			}
-		}
-		if (wret < 0)
-			ret = wret;
-		if (wret == 0) {
-			orig_slot += left_nr;
-			ret = update_node_key(trans, parent, pslot, mid);
-			if (ret) {
-				btrfs_tree_unlock(left);
-				free_extent_buffer(left);
-				return ret;
-			}
-			if (btrfs_header_nritems(left) > orig_slot) {
-				path->nodes[level] = left;
-				path->slots[level + 1] -= 1;
-				path->slots[level] = orig_slot;
-				btrfs_tree_unlock(mid);
-				free_extent_buffer(mid);
-			} else {
-				orig_slot -=
-					btrfs_header_nritems(left);
-				path->slots[level] = orig_slot;
-				btrfs_tree_unlock(left);
-				free_extent_buffer(left);
-			}
-			return 0;
-		}
-		btrfs_tree_unlock(left);
-		free_extent_buffer(left);
+	/* 1. Acquire siblings */
+	sib_count = get_locked_siblings(path, level, &bctl);
+	if (sib_count < 0) {
+		ret = sib_count;
+		goto out;
 	}
 
 	/*
-	 * then try to empty the right most buffer into the middle
+	 * If there is no parent, or there are no siblings to push to,
+	 * we cannot proceed.
 	 */
-	if (pslot + 1 < btrfs_header_nritems(parent)) {
-		u32 right_nr;
-
-		right = btrfs_read_node_slot(parent, pslot + 1);
-		if (IS_ERR(right))
-			return PTR_ERR(right);
-
-		btrfs_tree_lock_nested(right, BTRFS_NESTING_RIGHT);
-
-		right_nr = btrfs_header_nritems(right);
-		if (right_nr >= BTRFS_NODEPTRS_PER_BLOCK(fs_info) - 1) {
-			wret = 1;
-		} else {
-			ret = btrfs_cow_block(trans, root, right,
-					      parent, pslot + 1,
-					      &right, BTRFS_NESTING_RIGHT_COW);
-			if (ret)
-				wret = 1;
-			else {
-				wret = balance_node_right(trans, right, mid);
-			}
-		}
-		if (wret < 0)
-			ret = wret;
-		if (wret == 0) {
-			ret = update_node_key(trans, parent, pslot + 1, right);
-			if (ret) {
-				btrfs_tree_unlock(right);
-				free_extent_buffer(right);
-				return ret;
-			}
-			if (btrfs_header_nritems(mid) <= orig_slot) {
-				path->nodes[level] = right;
-				path->slots[level + 1] += 1;
-				path->slots[level] = orig_slot -
-					btrfs_header_nritems(mid);
-				btrfs_tree_unlock(mid);
-				free_extent_buffer(mid);
-			} else {
-				btrfs_tree_unlock(right);
-				free_extent_buffer(right);
-			}
-			return 0;
-		}
-		btrfs_tree_unlock(right);
-		free_extent_buffer(right);
+	if (!bctl.parent || sib_count == 0) {
+		ret = 1;
+		goto out;
 	}
-	return 1;
+
+	/* Initialize local variables. If a node is missing, set to max to avoid selection. */
+	l_nr = bctl.l ? btrfs_header_nritems(bctl.l) : (u32)-1;
+	r_nr = bctl.r ? btrfs_header_nritems(bctl.r) : (u32)-1;
+
+	/* Check if neighbors are also full */
+	if (min(l_nr, r_nr) >= BTRFS_NODEPTRS_PER_BLOCK(fs_info)) {
+		ret = 1;
+		goto out;
+	}
+
+	/* 2. Execute Push operation */
+	if (l_nr <= r_nr) {
+		/* Push to the left */
+		ret = btrfs_cow_block(trans, root, bctl.l, bctl.parent,
+				      bctl.pslot - 1, &bctl.l,
+				      BTRFS_NESTING_LEFT_COW);
+		if (ret)
+			goto out;
+
+		l_nr = btrfs_header_nritems(bctl.l);
+
+		orig_slot += l_nr;
+		ret = node_balance_move_l(trans, bctl.l, bctl.m,
+					  node_balance_full_npush(fs_info, l_nr));
+		if (ret)
+			goto out;
+
+		ret = update_node_key(trans, bctl.parent, bctl.pslot, bctl.m);
+		if (ret)
+			goto out;
+
+		/* Update Path */
+		if (btrfs_header_nritems(bctl.l) > orig_slot) {
+			path->nodes[level] = bctl.l;
+			path->slots[level + 1] -= 1;
+			path->slots[level] = orig_slot;
+			bctl.l = NULL; /* Ownership transferred to path */
+			btrfs_tree_unlock(m);
+			free_extent_buffer(m);
+		} else {
+			path->slots[level] = orig_slot - btrfs_header_nritems(bctl.l);
+		}
+	} else {
+		/* Push to the right */
+		ret = btrfs_cow_block(trans, root, bctl.r, bctl.parent,
+				      bctl.pslot + 1, &bctl.r,
+				      BTRFS_NESTING_RIGHT_COW);
+		if (ret)
+			goto out;
+
+		r_nr = btrfs_header_nritems(bctl.r);
+
+		ret = node_balance_move_r(trans, bctl.m, bctl.r,
+					  node_balance_full_npush(fs_info, r_nr));
+		if (ret)
+			goto out;
+
+		ret = update_node_key(trans, bctl.parent, bctl.pslot + 1, bctl.r);
+		if (ret)
+			goto out;
+
+		/* Update Path */
+		if (btrfs_header_nritems(m) <= orig_slot) {
+			path->nodes[level] = bctl.r;
+			path->slots[level + 1] += 1;
+			path->slots[level] = orig_slot - btrfs_header_nritems(m);
+			bctl.r = NULL; /* Ownership transferred to path */
+			btrfs_tree_unlock(m);
+			free_extent_buffer(m);
+		}
+	}
+
+	/* Integrity check */
+	if (unlikely(orig_ptr !=
+		     btrfs_node_blockptr(path->nodes[level], path->slots[level]))) {
+		btrfs_crit(fs_info,
+			"push_nodes integrity failed: level %d slot %d orig_ptr %llu",
+			level, path->slots[level], orig_ptr);
+		BUG();
+	}
+
+out:
+	free_balance_control(&bctl);
+	return ret;
 }
 
 /*
