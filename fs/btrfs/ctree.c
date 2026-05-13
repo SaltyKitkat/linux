@@ -1112,6 +1112,101 @@ static int node_balance_move_r(struct btrfs_trans_handle *trans,
 }
 
 /*
+ * Structure to pass node context during balancing to reduce function
+ * argument count.
+ */
+struct node_balance_ctl {
+	struct extent_buffer *parent;
+	struct extent_buffer *l;
+	struct extent_buffer *m;
+	struct extent_buffer *r;
+	u32 pslot;
+};
+
+/*
+ * Release locks and references held in the balance control structure.
+ */
+static void free_balance_control(struct node_balance_ctl *bctl)
+{
+	if (bctl->l) {
+		btrfs_tree_unlock(bctl->l);
+		free_extent_buffer(bctl->l);
+		bctl->l = NULL;
+	}
+	if (bctl->r) {
+		btrfs_tree_unlock(bctl->r);
+		free_extent_buffer(bctl->r);
+		bctl->r = NULL;
+	}
+}
+
+/*
+ * Acquire and lock left/right siblings.
+ *
+ * This function handles:
+ * 1. Checking if a parent exists (handling BTRFS_MAX_LEVEL and path integrity).
+ * 2. If a parent exists, attempting to lock the left and right siblings.
+ *
+ * Return values:
+ * >= 0: The number of siblings successfully locked (0, 1, or 2).
+ * < 0 : Error code.
+ *
+ * Note: If this returns 0, the caller must check bctl->parent to distinguish
+ * between "root node (no parent)" and "parent exists but no siblings".
+ */
+ static int get_locked_siblings(struct btrfs_path *path, u8 level,
+				struct node_balance_ctl *bctl)
+{
+	int count = 0;
+
+	/* Initialize bctl */
+	bctl->parent = NULL;
+	bctl->m = path->nodes[level];
+	bctl->l = NULL;
+	bctl->r = NULL;
+	bctl->pslot = 0;
+
+	if (level >= BTRFS_MAX_LEVEL - 1 || !path->nodes[level + 1])
+		return 0;
+
+	bctl->parent = path->nodes[level + 1];
+	bctl->pslot = path->slots[level + 1];
+
+	/* Get the left sibling */
+	if (bctl->pslot > 0) {
+		struct extent_buffer *l = btrfs_read_node_slot(bctl->parent, bctl->pslot - 1);
+		if (IS_ERR(l))
+			return PTR_ERR(l);
+		btrfs_tree_lock_nested(l, BTRFS_NESTING_LEFT);
+		bctl->l = l;
+		count++;
+	}
+
+	/* Get the right sibling */
+	if (bctl->pslot + 1 < btrfs_header_nritems(bctl->parent)) {
+		struct extent_buffer *r = btrfs_read_node_slot(bctl->parent, bctl->pslot + 1);
+		if (IS_ERR(r)) {
+			/*
+			 * If looking up the right node fails, we must release
+			 * the left one and clear it from bctl to avoid
+			 * returning a dirty state.
+			 */
+			if (bctl->l) {
+				btrfs_tree_unlock(bctl->l);
+				free_extent_buffer(bctl->l);
+				bctl->l = NULL;
+			}
+			return PTR_ERR(r);
+		}
+		btrfs_tree_lock_nested(r, BTRFS_NESTING_RIGHT);
+		bctl->r = r;
+		count++;
+	}
+
+	return count;
+}
+
+/*
  * node level balancing, used to make sure nodes are in proper order for
  * item deletion.  We balance from the top down, so we have to make sure
  * that a deletion won't leave an node completely empty later on.
