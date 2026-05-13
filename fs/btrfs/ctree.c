@@ -66,6 +66,13 @@ static int node_balance_lomark(const struct btrfs_fs_info *fs_info)
 {
 	return BTRFS_NODEPTRS_PER_BLOCK(fs_info) * 6 / 10;
 }
+
+static int node_balance_full_npush(const struct btrfs_fs_info *fs_info, int n_dst)
+{
+	int cap = BTRFS_NODEPTRS_PER_BLOCK(fs_info);
+	int free = cap - n_dst;
+	return min(cap / 5, free / 2);
+}
 /*
  * The leaf data grows from end-to-front in the node.  this returns the address
  * of the start of the last item, which is the stop of the leaf data stack.
