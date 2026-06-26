@@ -636,6 +636,7 @@ int btrfs_force_cow_block(struct btrfs_trans_handle *trans,
 	btrfs_inhibit_eb_writeback(trans, cow);
 
 	*cow_ret = cow;
+	atomic64_inc(&fs_info->cow_count);
 	return 0;
 
 error_unlock_cow:

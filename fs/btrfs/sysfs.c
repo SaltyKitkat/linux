@@ -1229,6 +1229,15 @@ static ssize_t btrfs_commit_stats_store(struct kobject *kobj,
 }
 BTRFS_ATTR_RW(, commit_stats, btrfs_commit_stats_show, btrfs_commit_stats_store);
 
+static ssize_t btrfs_cow_count_show(struct kobject *kobj,
+				    struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+
+	return sysfs_emit(buf, "%llu\n", atomic64_read(&fs_info->cow_count));
+}
+BTRFS_ATTR(, cow_count, btrfs_cow_count_show);
+
 static ssize_t btrfs_clone_alignment_show(struct kobject *kobj,
 				struct kobj_attribute *a, char *buf)
 {
@@ -1598,6 +1607,7 @@ static const struct attribute *btrfs_attrs[] = {
 	BTRFS_ATTR_PTR(, read_policy),
 	BTRFS_ATTR_PTR(, bg_reclaim_threshold),
 	BTRFS_ATTR_PTR(, commit_stats),
+	BTRFS_ATTR_PTR(, cow_count),
 	BTRFS_ATTR_PTR(, temp_fsid),
 	NULL,
 };
