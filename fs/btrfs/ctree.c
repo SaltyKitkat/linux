@@ -4584,6 +4584,45 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 }
 
 /*
+ * Readahead forward sibling nodes whose generation meets min_trans.
+ * Called from btrfs_search_forward() to prefetch leaves before the
+ * next ioctl search lands on them.
+ */
+static void readahead_forward_gen(struct extent_buffer *node, int slot,
+				  u64 min_trans, int reada)
+{
+	struct btrfs_fs_info *fs_info = node->fs_info;
+	u32 blocksize = fs_info->nodesize;
+	u64 target = btrfs_node_blockptr(node, slot);
+	u64 nread = 0;
+	u64 nread_max = 4 * blocksize;
+	u32 nritems = btrfs_header_nritems(node);
+
+	/* Only prefetch leaves (node at level 1 -> children are level 0). */
+	if (btrfs_header_level(node) != 1)
+		return;
+	if (reada != READA_FORWARD_ALWAYS && reada != READA_FORWARD)
+		return;
+
+	for (int i = slot + 1; i < nritems; i++) {
+		if (btrfs_node_ptr_generation(node, i) < min_trans)
+			continue;
+
+		if (reada != READA_FORWARD_ALWAYS) {
+			u64 bytenr = btrfs_node_blockptr(node, i);
+			u64 dist = (bytenr > target) ? bytenr - target : target - bytenr;
+
+			if (dist > 65536)
+				break;
+		}
+		btrfs_readahead_node_child(node, i);
+		nread += blocksize;
+		if (nread >= nread_max)
+			break;
+	}
+}
+
+/*
  * A helper function to walk down the tree starting at min_key, and looking
  * for leaves that have a minimum transaction id.
  * This is used by the btree defrag code, and tree logging
@@ -4660,6 +4699,10 @@ again:
 			}
 			break;
 		}
+
+		if (slot < nritems && path->reada != READA_NONE)
+			readahead_forward_gen(cur, slot, min_trans,
+					     path->reada);
 find_next_key:
 		/*
 		 * we didn't find a candidate key in this node, walk forward

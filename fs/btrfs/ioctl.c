@@ -1543,6 +1543,8 @@ static noinline int search_ioctl(struct btrfs_root *root,
 	if (!path)
 		return -ENOMEM;
 
+	path->reada = READA_FORWARD;
+
 	if (sk->tree_id == 0) {
 		/* Search the root that we got passed. */
 		root = btrfs_grab_root(root);
