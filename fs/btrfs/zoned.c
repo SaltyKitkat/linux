@@ -824,6 +824,11 @@ int btrfs_check_mountopts_zoned(const struct btrfs_fs_info *info,
 		btrfs_clear_opt(*mount_opt, DISCARD_ASYNC);
 	}
 
+	if (btrfs_raw_test_opt(*mount_opt, SEQ_META)) {
+		btrfs_err(info, "zoned: seq_meta is not supported on zoned filesystems");
+		return -EINVAL;
+	}
+
 	return 0;
 }
 

@@ -21,6 +21,7 @@ struct btrfs_extent_inline_ref;
 enum btrfs_extent_allocation_policy {
 	BTRFS_EXTENT_ALLOC_CLUSTERED,
 	BTRFS_EXTENT_ALLOC_ZONED,
+	BTRFS_EXTENT_ALLOC_SEQ,
 };
 
 struct find_free_extent_ctl {

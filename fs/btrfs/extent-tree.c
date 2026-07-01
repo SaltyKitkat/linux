@@ -4195,6 +4195,52 @@ out:
 	return ret;
 }
 
+/*
+ * Sequential allocator for non-zoned metadata block groups.
+ *
+ * Allocates from the bump pointer (alloc_offset) forward, skipping
+ * used blocks via the existing free space cache.  When the pointer
+ * reaches the end of the block group and actual usage is still low,
+ * the pointer resets so freed blocks behind it are reused (still
+ * sequentially).  Otherwise the BG is closed and the allocator
+ * falls through to the next one.
+ */
+static int do_allocation_seq(struct btrfs_block_group *block_group,
+			     struct find_free_extent_ctl *ffe_ctl)
+{
+	u64 offset;
+
+	ASSERT(!btrfs_is_zoned(block_group->fs_info));
+
+retry:
+	offset = btrfs_find_space_for_alloc(block_group,
+			block_group->start + READ_ONCE(block_group->alloc_offset),
+			ffe_ctl->num_bytes, 0,
+			&ffe_ctl->max_extent_size);
+	if (!offset) {
+		/*
+		 * Bump pointer hit the end.  If the block group still
+		 * has plenty of free space behind the pointer (low
+		 * actual usage), reset and retry from the beginning.
+		 * Otherwise close it.
+		 */
+		u64 used = READ_ONCE(block_group->used);
+
+		if (used * 100 / block_group->length < 30) {
+			WRITE_ONCE(block_group->alloc_offset, 0);
+			goto retry;
+		}
+		return 1;
+	}
+
+	/* Advance the bump pointer past this allocation. */
+	WRITE_ONCE(block_group->alloc_offset,
+		   offset - block_group->start + ffe_ctl->num_bytes);
+
+	ffe_ctl->found_offset = offset;
+	return 0;
+}
+
 static int do_allocation(struct btrfs_block_group *block_group,
 			 struct find_free_extent_ctl *ffe_ctl,
 			 struct btrfs_block_group **bg_ret)
@@ -4204,6 +4250,8 @@ static int do_allocation(struct btrfs_block_group *block_group,
 		return do_allocation_clustered(block_group, ffe_ctl, bg_ret);
 	case BTRFS_EXTENT_ALLOC_ZONED:
 		return do_allocation_zoned(block_group, ffe_ctl, bg_ret);
+	case BTRFS_EXTENT_ALLOC_SEQ:
+		return do_allocation_seq(block_group, ffe_ctl);
 	default:
 		BUG();
 	}
@@ -4218,6 +4266,9 @@ static void release_block_group(struct btrfs_block_group *block_group,
 		ffe_ctl->retry_uncached = false;
 		break;
 	case BTRFS_EXTENT_ALLOC_ZONED:
+		/* Nothing to do */
+		break;
+	case BTRFS_EXTENT_ALLOC_SEQ:
 		/* Nothing to do */
 		break;
 	default:
@@ -4249,6 +4300,9 @@ static void found_extent(struct find_free_extent_ctl *ffe_ctl,
 		found_extent_clustered(ffe_ctl, ins);
 		break;
 	case BTRFS_EXTENT_ALLOC_ZONED:
+		/* Nothing to do */
+		break;
+	case BTRFS_EXTENT_ALLOC_SEQ:
 		/* Nothing to do */
 		break;
 	default:
@@ -4528,6 +4582,8 @@ static int prepare_allocation(struct btrfs_fs_info *fs_info,
 						    space_info, ins);
 	case BTRFS_EXTENT_ALLOC_ZONED:
 		return prepare_allocation_zoned(fs_info, ffe_ctl, space_info);
+	case BTRFS_EXTENT_ALLOC_SEQ:
+		return 0;
 	default:
 		BUG();
 	}
@@ -4590,6 +4646,8 @@ static noinline int find_free_extent(struct btrfs_root *root,
 
 	if (btrfs_is_zoned(fs_info))
 		ffe_ctl->policy = BTRFS_EXTENT_ALLOC_ZONED;
+	else if (!is_data && btrfs_test_opt(fs_info, SEQ_META))
+		ffe_ctl->policy = BTRFS_EXTENT_ALLOC_SEQ;
 
 	ins->type = BTRFS_EXTENT_ITEM_KEY;
 	ins->objectid = 0;

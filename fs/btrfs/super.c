@@ -124,6 +124,7 @@ enum {
 	Opt_thread_pool,
 	Opt_treelog,
 	Opt_user_subvol_rm_allowed,
+	Opt_seq_meta,
 	Opt_norecovery,
 
 	/* Rescue options */
@@ -245,6 +246,7 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
 	fsparam_u32("thread_pool", Opt_thread_pool),
 	fsparam_flag_no("treelog", Opt_treelog),
 	fsparam_flag("user_subvol_rm_allowed", Opt_user_subvol_rm_allowed),
+	fsparam_flag("seq_meta", Opt_seq_meta),
 
 	/* Rescue options. */
 	fsparam_enum("rescue", Opt_rescue, btrfs_parameter_rescue),
@@ -546,6 +548,9 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_user_subvol_rm_allowed:
 		btrfs_set_opt(ctx->mount_opt, USER_SUBVOL_RM_ALLOWED);
+		break;
+	case Opt_seq_meta:
+		btrfs_set_opt(ctx->mount_opt, SEQ_META);
 		break;
 	case Opt_enospc_debug:
 		if (result.negated)
@@ -1127,6 +1132,8 @@ static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
 		seq_puts(seq, ",clear_cache");
 	if (btrfs_test_opt(info, USER_SUBVOL_RM_ALLOWED))
 		seq_puts(seq, ",user_subvol_rm_allowed");
+	if (btrfs_test_opt(info, SEQ_META))
+		seq_puts(seq, ",seq_meta");
 	if (btrfs_test_opt(info, ENOSPC_DEBUG))
 		seq_puts(seq, ",enospc_debug");
 	if (btrfs_test_opt(info, AUTO_DEFRAG))
