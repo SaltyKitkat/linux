@@ -1503,13 +1503,14 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 		return sib_count;
 
 	if (!bctl.parent) {
+		ASSERT(sib_count == 0);
 		if (btrfs_header_nritems(m) != 1)
 			return 0;
 		return promote_child_to_root(trans, root, path, level, m);
 	}
 
-	if (sib_count == 0)
-		return 0;
+	if (unlikely(sib_count == 0))
+		goto out;
 
 	/* 2. Gather state: item counts and COW needs. */
 	himark = node_balance_himark(fs_info);
@@ -1537,9 +1538,11 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 	} else if (bctl.r && m_nr + r_nr <= himark) {
 		use_r = true;
 	} else if (bctl.l && l_nr > lomark && !l_cow) {
-		use_l = true;	distribute = true;
+		use_l = true;
+		distribute = true;
 	} else if (bctl.r && r_nr > lomark && !r_cow) {
-		use_r = true;	distribute = true;
+		use_r = true;
+		distribute = true;
 	} else if (m_nr < BTRFS_NODEPTRS_PER_BLOCK(fs_info) / 4) {
 		use_l = (l_nr > r_nr);
 		use_r = !use_l && bctl.r;
@@ -1554,6 +1557,10 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 					      BTRFS_NESTING_LEFT_COW);
 			if (ret)
 				goto out;
+		} else if (bctl.l) {
+			btrfs_tree_unlock(bctl.l);
+			free_extent_buffer(bctl.l);
+			bctl.l = NULL;
 		}
 		if (use_r) {
 			ret = btrfs_cow_block(trans, root, bctl.r, bctl.parent,
@@ -1561,42 +1568,50 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 					      BTRFS_NESTING_RIGHT_COW);
 			if (ret)
 				goto out;
-		}
-		if (!use_r && bctl.r) {
+		} else if (bctl.r) {
 			btrfs_tree_unlock(bctl.r);
 			free_extent_buffer(bctl.r);
 			bctl.r = NULL;
 		}
-		if (!use_l && bctl.l) {
-			btrfs_tree_unlock(bctl.l);
-			free_extent_buffer(bctl.l);
-			bctl.l = NULL;
-		}
+
 		if (distribute)
 			ret = try_distribute_nodes(trans, root, path, level,
 						   &bctl, orig_slot);
 		else
 			ret = try_merge_nodes(trans, root, path, level, &bctl,
 					      orig_slot);
+		if (ret)
+			goto out;
+
+		/*
+		 * Integrity check: ensure the original slot still points to
+		 * the same block pointer.
+		 */
+		if (unlikely(orig_ptr !=
+			     btrfs_node_blockptr(path->nodes[level], path->slots[level]))) {
+			btrfs_crit(fs_info,
+				"path integrity failed: level %d slot %d orig_ptr %llu",
+				level, path->slots[level], orig_ptr);
+			ret = -EUCLEAN;
+			btrfs_abort_transaction(trans, ret);
+		}
 	}
 
-	if (ret)
-		goto out;
-
+out:
 	/*
-	 * 4. Integrity check: ensure the original slot still points to
-	 * the same block pointer.
+	 * 5. Ensure the node won't be left with a single pointer that later
+	 * deletions could empty entirely.  The old code enforced this during
+	 * balancing; catch a violation here as a safety net.
 	 */
-	if (unlikely(orig_ptr !=
-		     btrfs_node_blockptr(path->nodes[level], path->slots[level]))) {
+	if (!ret && unlikely(btrfs_header_nritems(path->nodes[level]) <= 1)) {
 		btrfs_crit(fs_info,
-			"path integrity failed: level %d slot %d orig_ptr %llu",
-			level, path->slots[level], orig_ptr);
+			"node left with %u item(s) after balance: level %d root %llu",
+			btrfs_header_nritems(path->nodes[level]),
+			level, btrfs_root_id(root));
 		ret = -EUCLEAN;
 		btrfs_abort_transaction(trans, ret);
 	}
 
-out:
 	free_balance_control(&bctl);
 	return ret;
 }
