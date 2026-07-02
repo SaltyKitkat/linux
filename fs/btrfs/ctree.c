@@ -1661,7 +1661,7 @@ static noinline int push_nodes_for_insert(struct btrfs_trans_handle *trans,
 	{
 		bool l_need_cow = bctl.l && should_cow_block(trans, root, bctl.l);
 		bool r_need_cow = bctl.r && should_cow_block(trans, root, bctl.r);
-		int himark = node_balance_himark(fs_info);
+		u32 himark = node_balance_himark(fs_info);
 
 		/*
 		 * Prefer a sibling that does not need COW to avoid the cost
