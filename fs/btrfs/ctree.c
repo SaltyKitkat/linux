@@ -62,7 +62,7 @@ static u32 node_balance_full_npush(const struct btrfs_fs_info *fs_info, int n_ds
 	u32 himark = node_balance_himark(fs_info);
 	u32 free = cap - n_dst;
 
-	ASSERT(n_dst <= himark);
+	ASSERT(n_dst < himark);
 	if (to_left) {
 		/*
 		 * When pushing to the left sibling, move more items to
