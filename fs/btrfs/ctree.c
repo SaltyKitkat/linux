@@ -1365,21 +1365,16 @@ static int try_merge_nodes(struct btrfs_trans_handle *trans,
 			/* Both->L: r fits in l after m was fully absorbed. */
 			wret = node_balance_move_l(trans, bctl->l, bctl->r,
 						   orig_r_nr);
-			if (wret < 0)
-				return wret;
 		} else {
 			/* R->M: move r items into m. */
 			wret = node_balance_move_l(trans, bctl->m, bctl->r,
 						   orig_r_nr);
-			if (wret < 0)
-				return wret;
-			ret = update_node_key(trans, bctl->parent,
-					      bctl->pslot, bctl->m);
-			if (ret)
-				return ret;
 		}
+		if (wret < 0)
+			return wret;
 
 		m_nr = btrfs_header_nritems(bctl->m);
+		ASSERT(btrfs_header_nritems(bctl->r) == 0);
 		ret = delete_tree_node(trans, root, path, level + 1,
 				       bctl->r, bctl->pslot + 1);
 		bctl->r = NULL;
