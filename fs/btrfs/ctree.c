@@ -1393,7 +1393,7 @@ static int try_merge_nodes(struct btrfs_trans_handle *trans,
 	 * so path->nodes[level] is never a stale pointer.  Deleting
 	 * r first (above) is safe — it is a sibling, not the path node.
 	 */
-	if (bctl->l && orig_slot < (int)pushed_to_l) {
+	if (bctl->l && orig_slot < pushed_to_l) {
 		path->nodes[level] = bctl->l;
 		path->slots[level] = orig_l_nr + orig_slot;
 		path->slots[level + 1] -= 1;
@@ -1408,7 +1408,7 @@ static int try_merge_nodes(struct btrfs_trans_handle *trans,
 		bctl->m = NULL;
 	} else {
 		/* Item still in m. */
-		path->slots[level] = orig_slot - (int)pushed_to_l;
+		path->slots[level] = orig_slot - pushed_to_l;
 	}
 
 	return ret;
