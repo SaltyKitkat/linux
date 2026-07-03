@@ -1411,14 +1411,18 @@ static int try_distribute_nodes(struct btrfs_trans_handle *trans,
  * item deletion. We balance from the top down, so we have to make sure
  * that a deletion won't leave a node completely empty later on.
  *
- * Action priority (elimin count first, then COW cost):
- *   1. Both->L   (elim=2, cow=l+r)  if l+r+m <= himark
- *   2. M->L      (elim=1, cow=0)    if l+m <= himark && l already COWed
- *   3. R->M      (elim=1, cow=0)    if m+r <= himark && r already COWed
- *   4. M->L      (elim=1, cow=1)    if l+m <= himark
- *   5. R->M      (elim=1, cow=1)    if m+r <= himark
- *   6. Dist L->M (elim=0, cow=0)    if l > lomark && l already COWed
- *   7. Dist R->M (elim=0, cow=0)    if r > lomark && r already COWed
+ * Action priority (eliminations first, then COW cost):
+ *   1. Both->L   (elim=2, cow=l+r)    if l+r+m <= himark
+ *   2. M->L      (elim=1, cow=0)      if l+m <= himark && l already COWed
+ *   3. R->M      (elim=1, cow=0)      if m+r <= himark && r already COWed
+ *   4. M->L      (elim=1, cow=1)      if l+m <= himark
+ *   5. R->M      (elim=1, cow=1)      if m+r <= himark
+ *   6. 3->2 merge (elim=1, cow=0..1)  if l+r+m <= 2*himark && at least one
+ *                                     sibling already COWed
+ *   7. Dist L->M (elim=0, cow=0)      if l > lomark && l already COWed
+ *   8. Dist R->M (elim=0, cow=0)      if r > lomark && r already COWed
+ *   9. Fallback  (elim=0, cow=0..1)   if m < 1/4 capacity: distribute, prefer
+ *                                     the heavier sibling
  *
  * Distributing with COW cost (elim=0, cow=1) is never worth it.
  */
@@ -1433,6 +1437,7 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 	int sib_count;
 	u64 orig_ptr;
 	u32 l_nr, m_nr, r_nr;
+	u32 lm, mr, lmr;
 	bool l_cow, r_cow;
 	bool use_l, use_r, distribute;
 	u32 himark, lomark;
@@ -1466,22 +1471,28 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 	r_nr = bctl.r ? btrfs_header_nritems(bctl.r) : 0;
 	l_cow = bctl.l && should_cow_block(trans, root, bctl.l);
 	r_cow = bctl.r && should_cow_block(trans, root, bctl.r);
+	lm = l_nr + m_nr;
+	mr = m_nr + r_nr;
+	lmr = l_nr + m_nr + r_nr;
 
 	/* 3. Pick action: which sibling to use, whether to COW, merge or distribute. */
 	use_l = false;
 	use_r = false;
 	distribute = false;
 
-	if (bctl.l && bctl.r && l_nr + m_nr + r_nr <= himark) {
+	if (bctl.l && bctl.r && lmr <= himark) {
 		use_l = true;
 		use_r = true;
-	} else if (bctl.l && l_nr + m_nr <= himark && !l_cow) {
+	} else if (bctl.l && lm <= himark && !l_cow) {
 		use_l = true;
-	} else if (bctl.r && m_nr + r_nr <= himark && !r_cow) {
+	} else if (bctl.r && mr <= himark && !r_cow) {
 		use_r = true;
-	} else if (bctl.l && l_nr + m_nr <= himark) {
+	} else if (bctl.l && lm <= himark) {
 		use_l = true;
-	} else if (bctl.r && m_nr + r_nr <= himark) {
+	} else if (bctl.r && mr <= himark) {
+		use_r = true;
+	} else if (bctl.l && bctl.r && (!l_cow || !r_cow) && lmr <= himark * 2) {
+		use_l = true;
 		use_r = true;
 	} else if (bctl.l && l_nr > lomark && !l_cow) {
 		use_l = true;
