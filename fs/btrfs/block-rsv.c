@@ -376,7 +376,8 @@ void btrfs_update_global_block_rsv(struct btrfs_fs_info *fs_info)
 	spin_lock(&sinfo->lock);
 	spin_lock(&block_rsv->lock);
 
-	block_rsv->size = min_t(u64, num_bytes, SZ_512M);
+	// block_rsv->size = min_t(u64, num_bytes, SZ_512M);
+	block_rsv->size = num_bytes;
 
 	if (block_rsv->reserved < block_rsv->size) {
 		num_bytes = block_rsv->size - block_rsv->reserved;
