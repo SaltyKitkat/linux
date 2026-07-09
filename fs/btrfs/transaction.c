@@ -145,10 +145,6 @@ void btrfs_put_transaction(struct btrfs_transaction *transaction)
 		BUG_ON(!list_empty(&transaction->list));
 		WARN_ON(!xa_empty(&transaction->delayed_refs.head_refs));
 		WARN_ON(!xa_empty(&transaction->delayed_refs.dirty_extents));
-		if (transaction->delayed_refs.pending_csums)
-			btrfs_err(transaction->fs_info,
-				  "pending csums is %llu",
-				  transaction->delayed_refs.pending_csums);
 		/*
 		 * If any block groups are found in ->deleted_bgs then it's
 		 * because the transaction was aborted and a commit did not

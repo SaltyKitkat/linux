@@ -56,21 +56,20 @@ bool btrfs_check_space_for_delayed_refs(struct btrfs_fs_info *fs_info)
 /*
  * Release a ref head's reservation.
  *
- * @fs_info:  the filesystem
- * @nr_refs:  number of delayed refs to drop
- * @nr_csums: number of csum items to drop
+ * @fs_info:       the filesystem
+ * @nr_insertions: number of extent item insertions to drop the reservation for
  *
- * Drops the delayed ref head's count from the delayed refs rsv and free any
- * excess reservation we had.
+ * Drops @nr_insertions nodesize worth of reservation from the delayed refs rsv
+ * and free any excess reservation we had.
  */
-void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info, int nr_refs, int nr_csums)
+void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info,
+				    unsigned int nr_insertions)
 {
 	struct btrfs_block_rsv *block_rsv = &fs_info->delayed_refs_rsv;
 	u64 num_bytes;
 	u64 released;
 
-	num_bytes = btrfs_calc_delayed_ref_bytes(fs_info, nr_refs);
-	num_bytes += btrfs_calc_delayed_ref_csum_bytes(fs_info, nr_csums);
+	num_bytes = btrfs_calc_delayed_ref_bytes(fs_info, nr_insertions);
 
 	released = btrfs_block_rsv_release(fs_info, block_rsv, num_bytes, NULL);
 	if (released)
@@ -81,9 +80,9 @@ void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info, int nr_refs, 
 /*
  * Adjust the size of the delayed refs rsv.
  *
- * This is to be called anytime we may have adjusted trans->delayed_ref_updates
- * or trans->delayed_ref_csum_deletions, it'll calculate the additional size and
- * add it to the delayed_refs_rsv.
+ * This is to be called anytime we may have added delayed ref heads whose
+ * execution will insert a new extent item (must_insert_reserved).  It charges
+ * one nodesize per such head to the delayed_refs_rsv.
  */
 void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans)
 {
@@ -96,9 +95,8 @@ void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans)
 	if (btrfs_is_testing(fs_info))
 		return;
 
-	num_bytes = btrfs_calc_delayed_ref_bytes(fs_info, trans->delayed_ref_updates);
-	num_bytes += btrfs_calc_delayed_ref_csum_bytes(fs_info,
-						       trans->delayed_ref_csum_deletions);
+	num_bytes = btrfs_calc_delayed_ref_bytes(fs_info,
+						 trans->delayed_ref_insertions);
 
 	if (num_bytes == 0)
 		return;
@@ -124,8 +122,7 @@ void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans)
 	delayed_rsv->reserved += reserved_bytes;
 	delayed_rsv->full = (delayed_rsv->reserved >= delayed_rsv->size);
 	spin_unlock(&delayed_rsv->lock);
-	trans->delayed_ref_updates = 0;
-	trans->delayed_ref_csum_deletions = 0;
+	trans->delayed_ref_insertions = 0;
 }
 
 /*
@@ -138,11 +135,12 @@ void btrfs_inc_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info)
 
 	spin_lock(&delayed_rsv->lock);
 	/*
-	 * Inserting a block group item does not require changing the free space
-	 * tree, only the extent tree or the block group tree, so this is all we
-	 * need.
+	 * Inserting a block group item is a single btree insertion, which can
+	 * grow the tree by at most one leaf, so a single nodesize is all we
+	 * need.  Updating the free space tree is handled by the per-head
+	 * insertion accounting for the tree blocks it COWs.
 	 */
-	delayed_rsv->size += btrfs_calc_insert_metadata_size(fs_info, 1);
+	delayed_rsv->size += btrfs_calc_delayed_ref_bytes(fs_info, 1);
 	delayed_rsv->full = false;
 	spin_unlock(&delayed_rsv->lock);
 }
@@ -154,7 +152,7 @@ void btrfs_inc_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info)
 void btrfs_dec_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info)
 {
 	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_refs_rsv;
-	const u64 num_bytes = btrfs_calc_insert_metadata_size(fs_info, 1);
+	const u64 num_bytes = btrfs_calc_delayed_ref_bytes(fs_info, 1);
 	u64 released;
 
 	released = btrfs_block_rsv_release(fs_info, delayed_rsv, num_bytes, NULL);
@@ -166,36 +164,22 @@ void btrfs_dec_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info)
 /*
  * Adjust the size of the delayed refs block reserve for 1 block group item
  * update.
+ *
+ * Updating a block group item does not grow any tree, so it reserves nothing in
+ * the delayed refs block reserve and relies on the global block reserve for the
+ * COW of the blocks it modifies.
  */
 void btrfs_inc_delayed_refs_rsv_bg_updates(struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_refs_rsv;
-
-	spin_lock(&delayed_rsv->lock);
-	/*
-	 * Updating a block group item does not result in new nodes/leaves and
-	 * does not require changing the free space tree, only the extent tree
-	 * or the block group tree, so this is all we need.
-	 */
-	delayed_rsv->size += btrfs_calc_metadata_size(fs_info, 1);
-	delayed_rsv->full = false;
-	spin_unlock(&delayed_rsv->lock);
 }
 
 /*
  * Adjust the size of the delayed refs block reserve to release space for 1
- * block group item update.
+ * block group item update.  Nothing was reserved for updates, so this is a
+ * no-op.
  */
 void btrfs_dec_delayed_refs_rsv_bg_updates(struct btrfs_fs_info *fs_info)
 {
-	struct btrfs_block_rsv *delayed_rsv = &fs_info->delayed_refs_rsv;
-	const u64 num_bytes = btrfs_calc_metadata_size(fs_info, 1);
-	u64 released;
-
-	released = btrfs_block_rsv_release(fs_info, delayed_rsv, num_bytes, NULL);
-	if (released > 0)
-		trace_btrfs_space_reservation(fs_info, "delayed_refs_rsv",
-					      0, released, 0);
 }
 
 /*
@@ -406,7 +390,6 @@ static inline void drop_delayed_ref(struct btrfs_fs_info *fs_info,
 	if (!list_empty(&ref->add_list))
 		list_del(&ref->add_list);
 	btrfs_put_delayed_ref(ref);
-	btrfs_delayed_refs_rsv_release(fs_info, 1, 0);
 }
 
 static bool merge_ref(struct btrfs_fs_info *fs_info,
@@ -624,7 +607,6 @@ static bool insert_delayed_ref(struct btrfs_trans_handle *trans,
 		if (ref->action == BTRFS_ADD_DELAYED_REF)
 			list_add_tail(&ref->add_list, &href->ref_add_list);
 		spin_unlock(&href->lock);
-		trans->delayed_ref_updates++;
 		return false;
 	}
 
@@ -666,10 +648,7 @@ static noinline void update_existing_head_ref(struct btrfs_trans_handle *trans,
 			 struct btrfs_delayed_ref_head *existing,
 			 struct btrfs_delayed_ref_head *update)
 {
-	struct btrfs_delayed_ref_root *delayed_refs =
-		&trans->transaction->delayed_refs;
 	struct btrfs_fs_info *fs_info = trans->fs_info;
-	int old_ref_mod;
 
 	BUG_ON(existing->is_data != update->is_data);
 
@@ -700,6 +679,16 @@ static noinline void update_existing_head_ref(struct btrfs_trans_handle *trans,
 		 */
 		existing->num_bytes = update->num_bytes;
 
+		/*
+		 * An existing head that wasn't inserting an extent item
+		 * now has to, so charge the delayed refs reserve for the
+		 * extra insertion.  Heads that were already charged are
+		 * skipped to avoid double accounting.
+		 */
+		if (!existing->insert_rsv_charged) {
+			existing->insert_rsv_charged = true;
+			trans->delayed_ref_insertions++;
+		}
 	}
 
 	if (update->extent_op) {
@@ -725,30 +714,8 @@ static noinline void update_existing_head_ref(struct btrfs_trans_handle *trans,
 	 * only need the lock for this case cause we could be processing it
 	 * currently, for refs we just added we know we're a-ok.
 	 */
-	old_ref_mod = existing->total_ref_mod;
 	existing->ref_mod += update->ref_mod;
 	existing->total_ref_mod += update->ref_mod;
-
-	/*
-	 * If we are going to from a positive ref mod to a negative or vice
-	 * versa we need to make sure to adjust pending_csums accordingly.
-	 * We reserve bytes for csum deletion when adding or updating a ref head
-	 * see add_delayed_ref_head() for more details.
-	 */
-	if (existing->is_data) {
-		u64 csum_leaves =
-			btrfs_csum_bytes_to_leaves(fs_info,
-						   existing->num_bytes);
-
-		if (existing->total_ref_mod >= 0 && old_ref_mod < 0) {
-			delayed_refs->pending_csums -= existing->num_bytes;
-			btrfs_delayed_refs_rsv_release(fs_info, 0, csum_leaves);
-		}
-		if (existing->total_ref_mod < 0 && old_ref_mod >= 0) {
-			delayed_refs->pending_csums += existing->num_bytes;
-			trans->delayed_ref_csum_deletions += csum_leaves;
-		}
-	}
 
 	spin_unlock(&existing->lock);
 }
@@ -801,6 +768,7 @@ static void init_delayed_ref_head(struct btrfs_delayed_ref_head *head_ref,
 	head_ref->ref_mod = count_mod;
 	head_ref->reserved_bytes = reserved;
 	head_ref->must_insert_reserved = must_insert_reserved;
+	head_ref->insert_rsv_charged = false;
 	head_ref->owning_root = generic_ref->owning_root;
 	head_ref->is_data = (generic_ref->type == BTRFS_REF_DATA);
 	head_ref->is_system = (generic_ref->ref_root == BTRFS_CHUNK_TREE_OBJECTID);
@@ -921,15 +889,15 @@ add_delayed_ref_head(struct btrfs_trans_handle *trans,
 		}
 		head_ref->tracked = true;
 		/*
-		 * We reserve the amount of bytes needed to delete csums when
-		 * adding the ref head and not when adding individual drop refs
-		 * since the csum items are deleted only after running the last
-		 * delayed drop ref (the data extent's ref count drops to 0).
+		 * Charge the delayed refs reserve for the extent item insertion
+		 * this head will perform.  Only heads that insert a new extent
+		 * item (must_insert_reserved) grow the extent tree and thus need
+		 * a reservation; updates and deletes rely on the global block
+		 * reserve for the COW of the blocks they touch.
 		 */
-		if (head_ref->is_data && head_ref->ref_mod < 0) {
-			delayed_refs->pending_csums += head_ref->num_bytes;
-			trans->delayed_ref_csum_deletions +=
-				btrfs_csum_bytes_to_leaves(fs_info, head_ref->num_bytes);
+		if (head_ref->must_insert_reserved) {
+			head_ref->insert_rsv_charged = true;
+			trans->delayed_ref_insertions++;
 		}
 		delayed_refs->num_heads++;
 		delayed_refs->num_heads_ready++;

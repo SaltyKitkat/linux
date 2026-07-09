@@ -1910,20 +1910,16 @@ u64 btrfs_cleanup_ref_head_accounting(struct btrfs_fs_info *fs_info,
 	u64 ret = 0;
 
 	/*
-	 * We had csum deletions accounted for in our delayed refs rsv, we need
-	 * to drop the csum leaves for this update from our delayed_refs_rsv.
+	 * Release the reservation charged for the extent item insertion this
+	 * head was going to perform.  This is done regardless of whether the
+	 * head was run (the insertion happened, the space was consumed) or
+	 * dropped before being run (the extent was never inserted, the space
+	 * is returned), as insert_rsv_charged is not cleared when the head is
+	 * run.
 	 */
-	if (head->total_ref_mod < 0 && head->is_data) {
-		int nr_csums;
-
-		spin_lock(&delayed_refs->lock);
-		delayed_refs->pending_csums -= head->num_bytes;
-		spin_unlock(&delayed_refs->lock);
-		nr_csums = btrfs_csum_bytes_to_leaves(fs_info, head->num_bytes);
-
-		btrfs_delayed_refs_rsv_release(fs_info, 0, nr_csums);
-
-		ret = btrfs_calc_delayed_ref_csum_bytes(fs_info, nr_csums);
+	if (head->insert_rsv_charged) {
+		btrfs_delayed_refs_rsv_release(fs_info, 1);
+		ret = btrfs_calc_delayed_ref_bytes(fs_info, 1);
 	}
 	/* must_insert_reserved can be set only if we didn't run the head ref. */
 	if (head->must_insert_reserved)
@@ -2057,8 +2053,6 @@ static int btrfs_run_delayed_refs_for_head(struct btrfs_trans_handle *trans,
 
 		ret = run_one_delayed_ref(trans, locked_ref, ref, extent_op,
 					  must_insert_reserved);
-		btrfs_delayed_refs_rsv_release(fs_info, 1, 0);
-		*bytes_released += btrfs_calc_delayed_ref_bytes(fs_info, 1);
 
 		btrfs_free_delayed_extent_op(extent_op);
 		if (ret) {

@@ -185,6 +185,15 @@ struct btrfs_delayed_ref_head {
 	 */
 	bool must_insert_reserved;
 
+	/*
+	 * Indicate whether the delayed_refs_rsv has been charged for the extent
+	 * item insertion that this head will perform.  This is decoupled from
+	 * must_insert_reserved because the latter is cleared once the head is
+	 * run, while the reservation has to be released when the head is cleaned
+	 * up regardless of whether it was run.
+	 */
+	bool insert_rsv_charged;
+
 	bool is_data;
 	bool is_system;
 	bool processing;
@@ -222,7 +231,7 @@ struct btrfs_delayed_ref_root {
 
 	/*
 	 * Protects the xarray head_refs, its entries and the following fields:
-	 * num_heads, num_heads_ready, pending_csums and run_delayed_start.
+	 * num_heads, num_heads_ready and run_delayed_start.
 	 */
 	spinlock_t lock;
 
@@ -234,12 +243,6 @@ struct btrfs_delayed_ref_root {
 	 * spinlock 'lock'.
 	 */
 	unsigned long num_heads_ready;
-
-	/*
-	 * Track space reserved for deleting csums of data extents.
-	 * Protected by the spinlock 'lock'.
-	 */
-	u64 pending_csums;
 
 	unsigned long flags;
 
@@ -306,36 +309,17 @@ extern struct kmem_cache *btrfs_delayed_extent_op_cachep;
 int __init btrfs_delayed_ref_init(void);
 void __cold btrfs_delayed_ref_exit(void);
 
+/*
+ * Each insertion into a btree can grow the tree by at most one leaf, so the
+ * delayed refs block reserve charges one nodesize per insertion.  Delayed ref
+ * heads that only update or delete extent items do not grow the tree and are
+ * not charged here; they rely on the global block reserve for the COW of the
+ * blocks they modify.
+ */
 static inline u64 btrfs_calc_delayed_ref_bytes(const struct btrfs_fs_info *fs_info,
 					       int num_delayed_refs)
 {
-	u64 num_bytes;
-
-	num_bytes = btrfs_calc_insert_metadata_size(fs_info, num_delayed_refs);
-
-	/*
-	 * We have to check the mount option here because we could be enabling
-	 * the free space tree for the first time and don't have the compat_ro
-	 * option set yet.
-	 *
-	 * We need extra reservations if we have the free space tree because
-	 * we'll have to modify that tree as well.
-	 */
-	if (btrfs_test_opt(fs_info, FREE_SPACE_TREE))
-		num_bytes *= 2;
-
-	return num_bytes;
-}
-
-static inline u64 btrfs_calc_delayed_ref_csum_bytes(const struct btrfs_fs_info *fs_info,
-						    int num_csum_items)
-{
-	/*
-	 * Deleting csum items does not result in new nodes/leaves and does not
-	 * require changing the free space tree, only the csum tree, so this is
-	 * all we need.
-	 */
-	return btrfs_calc_metadata_size(fs_info, num_csum_items);
+	return (u64)fs_info->nodesize * num_delayed_refs;
 }
 
 void btrfs_init_tree_ref(struct btrfs_ref *generic_ref, int level, u64 mod_root,
@@ -408,7 +392,8 @@ struct btrfs_delayed_ref_node *btrfs_select_delayed_ref(struct btrfs_delayed_ref
 
 int btrfs_check_delayed_seq(struct btrfs_fs_info *fs_info, u64 seq);
 
-void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info, int nr_refs, int nr_csums);
+void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info,
+				    unsigned int nr_insertions);
 void btrfs_update_delayed_refs_rsv(struct btrfs_trans_handle *trans);
 void btrfs_inc_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info);
 void btrfs_dec_delayed_refs_rsv_bg_inserts(struct btrfs_fs_info *fs_info);
