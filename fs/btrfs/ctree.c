@@ -3265,12 +3265,7 @@ static int btrfs_calc_push_right_items(const struct extent_buffer *left,
 	int push_items = 0;
 	u32 left_nritems = btrfs_header_nritems(left);
 	u32 i;
-	u32 nr;
-
-	if (empty)
-		nr = 0;
-	else
-		nr = max_t(u32, 1, min_slot);
+	u32 nr = empty ? 0 : max_t(u32, 1, min_slot);
 
 	if (path_slot >= left_nritems)
 		push_space += data_size;
@@ -3322,11 +3317,10 @@ static void btrfs_move_leaf_items_to_right(struct btrfs_trans_handle *trans,
 	struct btrfs_fs_info *fs_info = right->fs_info;
 	int left_nritems = btrfs_header_nritems(left);
 	int right_nritems = btrfs_header_nritems(right);
-	int push_space = btrfs_item_data_end(left, left_nritems - push_items);
+	int push_space = btrfs_item_data_end(left, left_nritems - push_items) -
+			 leaf_data_end(left);
 	int data_end;
 	int i;
-
-	push_space -= leaf_data_end(left);
 
 	/* make room in the right data area */
 	data_end = leaf_data_end(right);
@@ -3384,13 +3378,9 @@ static int btrfs_calc_push_left_items(const struct extent_buffer *right,
 	int push_space = 0;
 	int push_items = 0;
 	u32 right_nritems = btrfs_header_nritems(right);
-	u32 nr;
+	u32 nr = empty ? min(right_nritems, max_slot) :
+			 min(right_nritems - 1, max_slot);
 	int i;
-
-	if (empty)
-		nr = min(right_nritems, max_slot);
-	else
-		nr = min(right_nritems - 1, max_slot);
 
 	for (i = 0; i < nr; i++) {
 		if (!empty && push_items > 0) {
@@ -3434,6 +3424,7 @@ static void btrfs_move_leaf_items_to_left(struct btrfs_trans_handle *trans,
 	struct btrfs_fs_info *fs_info = left->fs_info;
 	int old_left_nritems = btrfs_header_nritems(left);
 	int right_nritems = btrfs_header_nritems(right);
+	int old_left_item_size = btrfs_item_offset(left, old_left_nritems - 1);
 	int push_space;
 	int i;
 
@@ -3446,11 +3437,9 @@ static void btrfs_move_leaf_items_to_left(struct btrfs_trans_handle *trans,
 	copy_leaf_data(left, right, leaf_data_end(left) - push_space,
 		       btrfs_item_offset(right, push_items - 1), push_space);
 
-	int old_left_item_size = btrfs_item_offset(left, old_left_nritems - 1);
 	for (i = old_left_nritems; i < old_left_nritems + push_items; i++) {
-		u32 ioff;
+		u32 ioff = btrfs_item_offset(left, i);
 
-		ioff = btrfs_item_offset(left, i);
 		btrfs_set_item_offset(left, i,
 		      ioff - (BTRFS_LEAF_DATA_SIZE(fs_info) - old_left_item_size));
 	}
@@ -3472,7 +3461,7 @@ static void btrfs_move_leaf_items_to_left(struct btrfs_trans_handle *trans,
 	btrfs_set_header_nritems(right, right_nritems);
 	push_space = BTRFS_LEAF_DATA_SIZE(fs_info);
 	for (i = 0; i < right_nritems; i++) {
-		push_space = push_space - btrfs_item_size(right, i);
+		push_space -= btrfs_item_size(right, i);
 		btrfs_set_item_offset(right, i, push_space);
 	}
 
@@ -3576,18 +3565,16 @@ static noinline int push_leaf_right(struct btrfs_trans_handle *trans,
 
 	/* then fixup the leaf pointer in the path */
 	/*
-	 * left_nritems has been updated in btrfs_move_leaf_items_to_right.
-	 * We need to check against the new count.
-	 * The original code did:
-	 *    left_nritems -= push_items;
-	 *    if (path->slots[0] >= left_nritems) ...
+	 * btrfs_move_leaf_items_to_right() has updated the number of items
+	 * in left, so compare slots[0] against the new count to decide
+	 * whether it ended up in the right leaf.
 	 */
 	if (path->slots[0] >= btrfs_header_nritems(left)) {
 		path->slots[0] -= btrfs_header_nritems(left);
 		btrfs_tree_unlock(left);
 		free_extent_buffer(left);
 		path->nodes[0] = right;
-		path->slots[1] += 1;
+		path->slots[1]++;
 	} else {
 		btrfs_tree_unlock(right);
 		free_extent_buffer(right);
@@ -3673,12 +3660,12 @@ static noinline int push_leaf_left(struct btrfs_trans_handle *trans,
 		ret = 1;
 		goto out;
 	}
-	WARN_ON(!empty && push_items == btrfs_header_nritems(right));
+	WARN_ON(!empty && push_items == right_nritems);
 
 	/* Capture this before move updates left header */
 	old_left_nritems = btrfs_header_nritems(left);
 
-	/* Check logic consistency with original code safety check */
+	/* Defensive, btrfs_calc_push_left_items() already bounds the count */
 	if (unlikely(push_items > right_nritems)) {
 		ret = -EUCLEAN;
 		btrfs_abort_transaction(trans, ret);
@@ -3698,7 +3685,7 @@ static noinline int push_leaf_left(struct btrfs_trans_handle *trans,
 		btrfs_tree_unlock(right);
 		free_extent_buffer(right);
 		path->nodes[0] = left;
-		path->slots[1] -= 1;
+		path->slots[1]--;
 	} else {
 		btrfs_tree_unlock(left);
 		free_extent_buffer(left);
