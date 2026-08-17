@@ -3498,8 +3498,7 @@ static noinline int push_leaf_right(struct btrfs_trans_handle *trans,
 	int push_items;
 	int ret;
 
-	if (!path->nodes[1])
-		return 1;
+	ASSERT(path->nodes[1]);
 
 	slot = path->slots[1];
 	upper = path->nodes[1];
@@ -3611,10 +3610,10 @@ static noinline int push_leaf_left(struct btrfs_trans_handle *trans,
 	int push_items;
 	int ret = 0;
 
+	ASSERT(path->nodes[1]);
+
 	slot = path->slots[1];
 	if (slot == 0)
-		return 1;
-	if (!path->nodes[1])
 		return 1;
 
 	right_nritems = btrfs_header_nritems(right);
