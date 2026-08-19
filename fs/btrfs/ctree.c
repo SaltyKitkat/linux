@@ -4761,15 +4761,16 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
 	return ret;
 }
 /*
- * Return true if @leaf can be fully emptied into its neighbours given the
- * free space currently available in them.  @left/@right may be NULL.
+ * Return true if the middle leaf of @bctl can be fully emptied into its
+ * neighbours given the free space currently available in them.  bctl->l
+ * and bctl->r may be NULL.
  *
- * The checks mirror exactly what the push paths that follow will do: @left
- * receives the head of @leaf packed as tightly as it allows, and @right
- * receives every item left behind.  Pushing to @left greedily maximises the
- * number of items it takes, so the tail @right would have to take is the
- * smallest possible; if even that does not fit, no split of @leaf can empty
- * it.
+ * The checks mirror exactly what the push paths that follow will do: the
+ * left neighbour receives the head of the middle leaf packed as tightly as
+ * it allows, and the right neighbour receives every item left behind.
+ * Pushing to the left greedily maximises the number of items it takes, so
+ * the tail the right would have to take is the smallest possible; if even
+ * that does not fit, no split can empty the leaf.
  *
  * The btrfs_calc_push_*_items() calls here use the same arguments the
  * pushes pass (empty=true, data_size=0, unbounded slot window), so the
@@ -4777,25 +4778,26 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
  * (With those arguments path_slot only ever feeds data_size additions of
  * zero, so it plays no role here.)
  */
-static bool balance_leaf_can_empty(const struct extent_buffer *leaf,
-				   const struct extent_buffer *left,
-				   const struct extent_buffer *right)
+static bool balance_leaf_can_empty(const struct node_balance_ctl *bctl)
 {
-	u32 nritems = btrfs_header_nritems(leaf);
+	const struct extent_buffer *m = bctl->m;
+	const struct extent_buffer *l = bctl->l;
+	const struct extent_buffer *r = bctl->r;
+	u32 nritems = btrfs_header_nritems(m);
 	u32 left_items, right_items;
 
-	left_items = left ? btrfs_calc_push_left_items(leaf, left, 0,
-				btrfs_leaf_free_space(left), (u32)-1,
+	left_items = l ? btrfs_calc_push_left_items(m, l, 0,
+				btrfs_leaf_free_space(l), (u32)-1,
 				0, true) : 0;
 
 	if (left_items >= nritems)
 		return true;
-	if (!right)
+	if (!r)
 		return false;
 
 	/* @right must be able to take every remaining item. */
-	right_items = btrfs_calc_push_right_items(leaf, right, 0,
-				btrfs_leaf_free_space(right), 0, 0, true);
+	right_items = btrfs_calc_push_right_items(m, r, 0,
+				btrfs_leaf_free_space(r), 0, 0, true);
 	return left_items + right_items >= nritems;
 }
 
@@ -4803,14 +4805,13 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 			struct btrfs_root *root,
 			struct btrfs_path *path)
 {
+	struct node_balance_ctl bctl = { 0 };
 	struct extent_buffer *leaf = path->nodes[0];
 	struct extent_buffer *upper = path->nodes[1];
-	struct extent_buffer *left = NULL;
-	struct extent_buffer *right = NULL;
 	struct btrfs_disk_key disk_key;
 	int ret = 0;
+	int sib_count;
 	int wret;
-	int slot = path->slots[1];
 	int out_slot;
 	u32 min_push_space;
 	u32 nritems;
@@ -4829,24 +4830,10 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 	 * path whose slots[1] still refers to @leaf.
 	 */
 
-	/* Lock both neighbours if present. */
-	if (slot > 0) {
-		left = btrfs_read_node_slot(upper, slot - 1);
-		if (IS_ERR(left))
-			return PTR_ERR(left);
-		btrfs_tree_lock_nested(left, BTRFS_NESTING_LEFT);
-	}
-	if (slot + 1 < btrfs_header_nritems(upper)) {
-		right = btrfs_read_node_slot(upper, slot + 1);
-		if (IS_ERR(right)) {
-			if (left) {
-				btrfs_tree_unlock(left);
-				free_extent_buffer(left);
-			}
-			return PTR_ERR(right);
-		}
-		btrfs_tree_lock_nested(right, BTRFS_NESTING_RIGHT);
-	}
+	/* Acquire and lock the left/right neighbours, if present. */
+	sib_count = get_locked_siblings(path, 0, &bctl);
+	if (sib_count < 0)
+		return sib_count;
 
 	/*
 	 * Only bother with the neighbours if @leaf can actually be emptied
@@ -4860,28 +4847,28 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 	 * clear it when they empty it, which is what btrfs_del_leaf() needs.
 	 */
 	if (btrfs_header_nritems(leaf) &&
-	    balance_leaf_can_empty(leaf, left, right)) {
+	    balance_leaf_can_empty(&bctl)) {
 		/*
 		 * Push as much as possible to the left neighbour.  We want to
 		 * be able to move at least the first item there.  @leaf is
 		 * guaranteed non-empty here.
 		 */
-		if (left) {
+		if (bctl.l) {
 			min_push_space = sizeof(struct btrfs_item) +
 					 btrfs_item_size(leaf, 0);
 
-			if (btrfs_leaf_free_space(left) >= min_push_space) {
-				wret = btrfs_cow_block(trans, root, left, upper,
-						       slot - 1, &left,
-						       BTRFS_NESTING_LEFT_COW);
+			if (btrfs_leaf_free_space(bctl.l) >= min_push_space) {
+				wret = btrfs_cow_block(trans, root, bctl.l,
+						       bctl.parent, bctl.pslot - 1,
+						       &bctl.l, BTRFS_NESTING_LEFT_COW);
 				if (wret < 0) {
 					if (wret != -ENOSPC)
 						ret = wret;
-				} else if (unlikely(check_sibling_keys(left, leaf))) {
+				} else if (unlikely(check_sibling_keys(bctl.l, leaf))) {
 					ret = -EUCLEAN;
 					btrfs_abort_transaction(trans, ret);
 				} else {
-					wret = push_leaf_items_to_left(trans, leaf, left, 0,
+					wret = push_leaf_items_to_left(trans, leaf, bctl.l, 0,
 								       min_push_space, true,
 								       (u32)-1, path->slots[0],
 								       &out_slot, &moved);
@@ -4900,48 +4887,41 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 		 * always runs as long as @leaf still has items, which is what allows
 		 * the leaf to be merged into both neighbours at once.
 		 */
-		if (right && btrfs_header_nritems(leaf)) {
+		if (bctl.r && btrfs_header_nritems(leaf)) {
 			nritems = btrfs_header_nritems(leaf);
 			min_push_space = leaf_space_used(leaf, 0, nritems);
 
-			if (btrfs_leaf_free_space(right) >= min_push_space) {
-				wret = btrfs_cow_block(trans, root, right, upper,
-							       slot + 1, &right,
-							       BTRFS_NESTING_RIGHT_COW);
+			if (btrfs_leaf_free_space(bctl.r) >= min_push_space) {
+				wret = btrfs_cow_block(trans, root, bctl.r,
+						       bctl.parent, bctl.pslot + 1,
+						       &bctl.r, BTRFS_NESTING_RIGHT_COW);
 				if (wret < 0) {
 					if (wret != -ENOSPC)
 						ret = wret;
-				} else if (unlikely(check_sibling_keys(leaf, right))) {
+				} else if (unlikely(check_sibling_keys(leaf, bctl.r))) {
 					ret = -EUCLEAN;
 					btrfs_abort_transaction(trans, ret);
 				} else {
-					wret = push_leaf_items_to_right(trans, leaf, right, 0,
+					wret = push_leaf_items_to_right(trans, leaf, bctl.r, 0,
 								       min_push_space, true,
 								       0, path->slots[0],
 								       &out_slot, &moved);
 					if (wret < 0)
 						ret = wret;
 					else if (wret == 0) {
-						/* right leaf's first key changed: refresh
-						 * its separator key in upper */
-						btrfs_item_key(right, &disk_key, 0);
-						btrfs_set_node_key(upper, &disk_key,
-								   slot + 1);
-						btrfs_mark_buffer_dirty(trans, upper);
+						/* right leaf's first key changed:
+						 * refresh its separator key in upper */
+						btrfs_item_key(bctl.r, &disk_key, 0);
+						btrfs_set_node_key(bctl.parent, &disk_key,
+								   bctl.pslot + 1);
+						btrfs_mark_buffer_dirty(trans, bctl.parent);
 					}
 				}
 			}
 		}
 	}
 
-	if (left) {
-		btrfs_tree_unlock(left);
-		free_extent_buffer(left);
-	}
-	if (right) {
-		btrfs_tree_unlock(right);
-		free_extent_buffer(right);
-	}
+	free_balance_control(&bctl);
 
 	/*
 	 * If @leaf survived, its first key may have changed because we moved
@@ -4956,7 +4936,7 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 	}
 
 	if (btrfs_header_nritems(leaf) == 0) {
-		path->slots[1] = slot;
+		path->slots[1] = bctl.pslot;
 		ret = btrfs_del_leaf(trans, root, path, leaf);
 		if (ret < 0)
 			return ret;
