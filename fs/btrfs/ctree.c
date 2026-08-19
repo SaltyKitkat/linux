@@ -4801,9 +4801,9 @@ static bool balance_leaf_can_empty(const struct node_balance_ctl *bctl)
 	return left_items + right_items >= nritems;
 }
 
-static int balance_leaf(struct btrfs_trans_handle *trans,
-			struct btrfs_root *root,
-			struct btrfs_path *path)
+static noinline int balance_leaf(struct btrfs_trans_handle *trans,
+				 struct btrfs_root *root,
+				 struct btrfs_path *path)
 {
 	struct node_balance_ctl bctl = { 0 };
 	struct extent_buffer *leaf = path->nodes[0];
