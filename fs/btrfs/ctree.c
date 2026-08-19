@@ -3261,40 +3261,58 @@ int btrfs_leaf_free_space(const struct extent_buffer *leaf)
 }
 
 /*
- * Calculate how many items can be pushed from the left leaf to the right leaf.
+ * Calculate how many items can be pushed from @src into its adjacent leaf.
  *
- * @left:        The source leaf.
- * @right:       The destination leaf.
- * @data_size:   The amount of data we want to free in the left leaf.
- * @free_space:  The available free space in the right leaf.
- * @min_slot:    The minimum slot index in the left leaf to consider moving.
- * @path_slot:   The current slot of interest in the path (to protect/move).
- * @empty:       Whether we are trying to empty the left leaf completely.
+ * One accounting routine covers both push directions: @src's head slots
+ * moving left, or its tail slots moving right.  The two guards are mirror
+ * images, so a single loop over @src's items with a direction flag
+ * suffices.
+ *
+ * @src:           The leaf we want to move items away from.
+ * @data_size:     The amount of data we want to free in @src; feeds the
+ *                 accounting of the item at @path_slot.
+ * @free_space:    The available free space in the destination leaf.
+ * @bound_slot:    Direction-sensitive bound on the slots that may move:
+ *                 for a left push the highest @src slot to consider, for a
+ *                 right push the lowest one.
+ * @path_slot:     The current slot of interest in the path.
+ * @empty:         Whether we are trying to empty @src completely.
+ * @to_left:       True pushes @src's head into the left neighbour, false
+ *                 pushes @src's tail into the right neighbour.
  *
  * Returns the number of items to push.
  */
-static int btrfs_calc_push_right_items(const struct extent_buffer *left,
-				       const struct extent_buffer *right,
-				       int data_size, int free_space,
-				       u32 min_slot, int path_slot,
-				       bool empty)
+static noinline int btrfs_calc_push_items(const struct extent_buffer *src,
+					  int data_size, int free_space,
+					  u32 bound_slot, int path_slot,
+					  bool empty, bool to_left)
 {
 	int push_space = 0;
 	int push_items = 0;
-	u32 left_nritems = btrfs_header_nritems(left);
-	u32 i;
-	u32 nr = empty ? 0 : max_t(u32, 1, min_slot);
+	u32 nritems = btrfs_header_nritems(src);
+	u32 nr;
+	int i;
+	int step;
 
-	if (path_slot >= left_nritems)
-		push_space += data_size;
+	if (to_left) {
+		nr = empty ? min(nritems, bound_slot) :
+			     min(nritems - 1, bound_slot);
+		i = 0;
+		step = 1;
+	} else {
+		nr = empty ? 0 : max_t(u32, 1, bound_slot);
+		i = (int)nritems - 1;
+		step = -1;
+		if (path_slot >= nritems)
+			push_space += data_size;
+	}
 
-	i = left_nritems - 1;
-	while (i >= nr) {
+	while (to_left ? (i < (int)nr) : (i >= (int)nr)) {
 		if (!empty && push_items > 0) {
-			if (path_slot > i)
+			if (to_left ? (path_slot < i) : (path_slot > i))
 				break;
 			if (path_slot == i) {
-				int space = btrfs_leaf_free_space(left);
+				int space = btrfs_leaf_free_space(src);
 
 				if (space + push_space * 2 > free_space)
 					break;
@@ -3304,16 +3322,15 @@ static int btrfs_calc_push_right_items(const struct extent_buffer *left,
 		if (path_slot == i)
 			push_space += data_size;
 
-		u32 this_item_size = btrfs_item_size(left, i);
+		u32 this_item_size = btrfs_item_size(src, i);
 		if (this_item_size + sizeof(struct btrfs_item) +
 		    push_space > free_space)
 			break;
 
 		push_items++;
 		push_space += this_item_size + sizeof(struct btrfs_item);
-		if (i == 0)
-			break;
-		i--;
+
+		i += step;
 	}
 	return push_items;
 }
@@ -3372,58 +3389,6 @@ static void btrfs_move_leaf_items_to_right(struct btrfs_trans_handle *trans,
 		btrfs_clear_buffer_dirty(trans, left);
 
 	btrfs_mark_buffer_dirty(trans, right);
-}
-
-/*
- * Calculate how many items can be pushed from the right leaf to the left leaf.
- *
- * @right:       The source leaf (path->nodes[0]).
- * @left:        The destination leaf (neighbor).
- * @data_size:   The amount of data we want to free in the right leaf.
- * @free_space:  The available free space in the left leaf.
- * @max_slot:    The maximum slot index in the right leaf to consider moving.
- * @path_slot:   The current slot of interest in the path.
- * @empty:       Whether we are trying to empty the right leaf completely.
- *
- * Returns the number of items to push.
- */
-static int btrfs_calc_push_left_items(const struct extent_buffer *right,
-				      const struct extent_buffer *left,
-				      int data_size, int free_space,
-				      u32 max_slot, int path_slot,
-				      bool empty)
-{
-	int push_space = 0;
-	int push_items = 0;
-	u32 right_nritems = btrfs_header_nritems(right);
-	u32 nr = empty ? min(right_nritems, max_slot) :
-			 min(right_nritems - 1, max_slot);
-	int i;
-
-	for (i = 0; i < nr; i++) {
-		if (!empty && push_items > 0) {
-			if (path_slot < i)
-				break;
-			if (path_slot == i) {
-				int space = btrfs_leaf_free_space(right);
-
-				if (space + push_space * 2 > free_space)
-					break;
-			}
-		}
-
-		if (path_slot == i)
-			push_space += data_size;
-
-		u32 this_item_size = btrfs_item_size(right, i);
-		if (this_item_size + sizeof(struct btrfs_item) + push_space >
-		    free_space)
-			break;
-
-		push_items++;
-		push_space += this_item_size + sizeof(struct btrfs_item);
-	}
-	return push_items;
 }
 
 /*
@@ -3534,9 +3499,9 @@ static int push_leaf_items_to_right(struct btrfs_trans_handle *trans,
 	if (free_space < data_size)
 		return 1;
 
-	push_items = btrfs_calc_push_right_items(src, dst, min_data_size,
-						 free_space, min_slot,
-						 cur_slot, empty);
+	push_items = btrfs_calc_push_items(src, min_data_size,
+					   free_space, min_slot,
+					   cur_slot, empty, false);
 	if (push_items == 0)
 		return 1;
 
@@ -3600,9 +3565,9 @@ static int push_leaf_items_to_left(struct btrfs_trans_handle *trans,
 	if (free_space < data_size)
 		return 1;
 
-	push_items = btrfs_calc_push_left_items(src, dst, min_data_size,
-						free_space, max_slot,
-						cur_slot, empty);
+	push_items = btrfs_calc_push_items(src, min_data_size,
+					   free_space, max_slot,
+					   cur_slot, empty, true);
 	if (push_items == 0)
 		return 1;
 
@@ -4772,7 +4737,7 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
  * the tail the right would have to take is the smallest possible; if even
  * that does not fit, no split can empty the leaf.
  *
- * The btrfs_calc_push_*_items() calls here use the same arguments the
+ * The btrfs_calc_push_items() calls here use the same arguments the
  * pushes pass (empty=true, data_size=0, unbounded slot window), so the
  * verdict stays in exact agreement with the actual moves by construction.
  * (With those arguments path_slot only ever feeds data_size additions of
@@ -4786,9 +4751,9 @@ static bool balance_leaf_can_empty(const struct node_balance_ctl *bctl)
 	u32 nritems = btrfs_header_nritems(m);
 	u32 left_items, right_items;
 
-	left_items = l ? btrfs_calc_push_left_items(m, l, 0,
+	left_items = l ? btrfs_calc_push_items(m, 0,
 				btrfs_leaf_free_space(l), (u32)-1,
-				0, true) : 0;
+				0, true, true) : 0;
 
 	if (left_items >= nritems)
 		return true;
@@ -4796,8 +4761,8 @@ static bool balance_leaf_can_empty(const struct node_balance_ctl *bctl)
 		return false;
 
 	/* @right must be able to take every remaining item. */
-	right_items = btrfs_calc_push_right_items(m, r, 0,
-				btrfs_leaf_free_space(r), 0, 0, true);
+	right_items = btrfs_calc_push_items(m, 0,
+				btrfs_leaf_free_space(r), 0, 0, true, false);
 	return left_items + right_items >= nritems;
 }
 
