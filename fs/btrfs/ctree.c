@@ -4857,9 +4857,10 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 	 * calls use (so it is in exact agreement with what they would do).
 	 * If it cannot, leave both neighbours untouched: pushing a partial
 	 * prefix over would only fill them - making a later complete merge
-	 * harder - plus COW and dirty them for no net gain.  (@leaf is still
-	 * marked dirty below; the caller already modified it when it removed
-	 * the items.)
+	 * harder - plus COW and dirty them for no net gain.  Dirtying of
+	 * @leaf is not this function's job: btrfs_del_items() marks it after
+	 * deleting the items, and the item moves mark it on survival and
+	 * clear it when they empty it, which is what btrfs_del_leaf() needs.
 	 */
 	if (btrfs_header_nritems(leaf) &&
 	    balance_leaf_can_empty(leaf, left, right)) {
@@ -4962,8 +4963,6 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 		ret = btrfs_del_leaf(trans, root, path, leaf);
 		if (ret < 0)
 			return ret;
-	} else {
-		btrfs_mark_buffer_dirty(trans, leaf);
 	}
 	return ret;
 }
@@ -5023,6 +5022,9 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 			fixup_low_keys(trans, path, &disk_key, 1);
 		}
 
+		/* This function modified the leaf; mark it dirty here. */
+		btrfs_mark_buffer_dirty(trans, leaf);
+
 		/*
 		 * Try to delete the leaf if it is mostly empty. We do this by
 		 * trying to move all its items into its left and right neighbours.
@@ -5033,8 +5035,6 @@ int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		 */
 		if (leaf != root->node && used < BTRFS_LEAF_DATA_SIZE(fs_info) / 3)
 			return balance_leaf(trans, root, path);
-		else
-			btrfs_mark_buffer_dirty(trans, leaf);
 	}
 	return ret;
 }
