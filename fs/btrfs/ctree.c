@@ -4764,24 +4764,21 @@ static bool balance_leaf_can_empty(const struct extent_buffer *leaf,
 				   const struct extent_buffer *right)
 {
 	u32 nritems = btrfs_header_nritems(leaf);
-	u32 left_items;
+	u32 left_items, right_items;
 
 	left_items = left ? btrfs_calc_push_left_items(leaf, left, 0,
-					btrfs_leaf_free_space(left), (u32)-1,
-					0, true) : 0;
+				btrfs_leaf_free_space(left), (u32)-1,
+				0, true) : 0;
 
-	/* @left on its own can take the whole leaf. */
 	if (left_items >= nritems)
 		return true;
-
-	/* No right neighbour to take what @left leaves behind. */
 	if (!right)
 		return false;
 
 	/* @right must be able to take every remaining item. */
-	return btrfs_calc_push_right_items(leaf, right, 0,
-			btrfs_leaf_free_space(right), 0, 0, true) >=
-		nritems - left_items;
+	right_items = btrfs_calc_push_right_items(leaf, right, 0,
+				btrfs_leaf_free_space(right), 0, 0, true);
+	return left_items + right_items >= nritems;
 }
 
 static int balance_leaf(struct btrfs_trans_handle *trans,
