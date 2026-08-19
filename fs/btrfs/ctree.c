@@ -4742,6 +4742,48 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
 
 	return ret;
 }
+/*
+ * Return true if @leaf can be fully emptied into its neighbours given the
+ * free space currently available in them.  @left/@right may be NULL.
+ *
+ * The checks mirror exactly what the push paths that follow will do: @left
+ * receives the head of @leaf packed as tightly as it allows, and @right
+ * receives every item left behind.  Pushing to @left greedily maximises the
+ * number of items it takes, so the tail @right would have to take is the
+ * smallest possible; if even that does not fit, no split of @leaf can empty
+ * it.
+ *
+ * The btrfs_calc_push_*_items() calls here use the same arguments the
+ * pushes pass (empty=true, data_size=0, unbounded slot window), so the
+ * verdict stays in exact agreement with the actual moves by construction.
+ * (With those arguments path_slot only ever feeds data_size additions of
+ * zero, so it plays no role here.)
+ */
+static bool balance_leaf_can_empty(const struct extent_buffer *leaf,
+				   const struct extent_buffer *left,
+				   const struct extent_buffer *right)
+{
+	u32 nritems = btrfs_header_nritems(leaf);
+	u32 left_items;
+
+	left_items = left ? btrfs_calc_push_left_items(leaf, left, 0,
+					btrfs_leaf_free_space(left), (u32)-1,
+					0, true) : 0;
+
+	/* @left on its own can take the whole leaf. */
+	if (left_items >= nritems)
+		return true;
+
+	/* No right neighbour to take what @left leaves behind. */
+	if (!right)
+		return false;
+
+	/* @right must be able to take every remaining item. */
+	return btrfs_calc_push_right_items(leaf, right, 0,
+			btrfs_leaf_free_space(right), 0, 0, true) >=
+		nritems - left_items;
+}
+
 static int balance_leaf(struct btrfs_trans_handle *trans,
 			struct btrfs_root *root,
 			struct btrfs_path *path)
@@ -4792,71 +4834,85 @@ static int balance_leaf(struct btrfs_trans_handle *trans,
 	}
 
 	/*
-	 * Push as much as possible to the left neighbour.  We want to be able
-	 * to move at least the first item there.
+	 * Only bother with the neighbours if @leaf can actually be emptied
+	 * into them, decided with the same space-accounting helpers the push
+	 * calls use (so it is in exact agreement with what they would do).
+	 * If it cannot, leave both neighbours untouched: pushing a partial
+	 * prefix over would only fill them - making a later complete merge
+	 * harder - plus COW and dirty them for no net gain.  (@leaf is still
+	 * marked dirty below; the caller already modified it when it removed
+	 * the items.)
 	 */
-	if (left && btrfs_header_nritems(leaf)) {
-		min_push_space = sizeof(struct btrfs_item) +
-				 btrfs_item_size(leaf, 0);
+	if (btrfs_header_nritems(leaf) &&
+	    balance_leaf_can_empty(leaf, left, right)) {
+		/*
+		 * Push as much as possible to the left neighbour.  We want to
+		 * be able to move at least the first item there.  @leaf is
+		 * guaranteed non-empty here.
+		 */
+		if (left) {
+			min_push_space = sizeof(struct btrfs_item) +
+					 btrfs_item_size(leaf, 0);
 
-		if (btrfs_leaf_free_space(left) >= min_push_space) {
-			wret = btrfs_cow_block(trans, root, left, upper,
-					       slot - 1, &left,
-					       BTRFS_NESTING_LEFT_COW);
-			if (wret < 0) {
-				if (wret != -ENOSPC)
-					ret = wret;
-			} else if (unlikely(check_sibling_keys(left, leaf))) {
-				ret = -EUCLEAN;
-				btrfs_abort_transaction(trans, ret);
-			} else {
-				wret = push_leaf_items_to_left(trans, leaf, left, 0,
-							       min_push_space, true,
-							       (u32)-1, path->slots[0],
-							       &out_slot, &moved);
-				if (wret < 0)
-					ret = wret;
-				else if (wret == 0)
-					pushed_left = true;
+			if (btrfs_leaf_free_space(left) >= min_push_space) {
+				wret = btrfs_cow_block(trans, root, left, upper,
+						       slot - 1, &left,
+						       BTRFS_NESTING_LEFT_COW);
+				if (wret < 0) {
+					if (wret != -ENOSPC)
+						ret = wret;
+				} else if (unlikely(check_sibling_keys(left, leaf))) {
+					ret = -EUCLEAN;
+					btrfs_abort_transaction(trans, ret);
+				} else {
+					wret = push_leaf_items_to_left(trans, leaf, left, 0,
+								       min_push_space, true,
+								       (u32)-1, path->slots[0],
+								       &out_slot, &moved);
+					if (wret < 0)
+						ret = wret;
+					else if (wret == 0)
+						pushed_left = true;
+				}
 			}
 		}
-	}
 
-	/*
-	 * Then push whatever is left to the right neighbour.  Unlike the old
-	 * path-based code, this no longer depends on whether the path still
-	 * points at @leaf - the left push above never re-pointed it - so it
-	 * always runs as long as @leaf still has items, which is what allows
-	 * the leaf to be merged into both neighbours at once.
-	 */
-	if (right && btrfs_header_nritems(leaf)) {
-		nritems = btrfs_header_nritems(leaf);
-		min_push_space = leaf_space_used(leaf, 0, nritems);
+		/*
+		 * Then push whatever is left to the right neighbour.  Unlike the
+		 * old path-based code, this no longer depends on whether the path
+		 * still points at @leaf - the left push above never re-pointed it - so it
+		 * always runs as long as @leaf still has items, which is what allows
+		 * the leaf to be merged into both neighbours at once.
+		 */
+		if (right && btrfs_header_nritems(leaf)) {
+			nritems = btrfs_header_nritems(leaf);
+			min_push_space = leaf_space_used(leaf, 0, nritems);
 
-		if (btrfs_leaf_free_space(right) >= min_push_space) {
-			wret = btrfs_cow_block(trans, root, right, upper,
-					       slot + 1, &right,
-					       BTRFS_NESTING_RIGHT_COW);
-			if (wret < 0) {
-				if (wret != -ENOSPC)
-					ret = wret;
-			} else if (unlikely(check_sibling_keys(leaf, right))) {
-				ret = -EUCLEAN;
-				btrfs_abort_transaction(trans, ret);
-			} else {
-				wret = push_leaf_items_to_right(trans, leaf, right, 0,
-							       min_push_space, true,
-							       0, path->slots[0],
-							       &out_slot, &moved);
-				if (wret < 0)
-					ret = wret;
-				else if (wret == 0) {
-					/* right leaf's first key changed:
-					 * refresh its separator key in upper */
-					btrfs_item_key(right, &disk_key, 0);
-					btrfs_set_node_key(upper, &disk_key,
+			if (btrfs_leaf_free_space(right) >= min_push_space) {
+				wret = btrfs_cow_block(trans, root, right, upper,
+							       slot + 1, &right,
+							       BTRFS_NESTING_RIGHT_COW);
+				if (wret < 0) {
+					if (wret != -ENOSPC)
+						ret = wret;
+				} else if (unlikely(check_sibling_keys(leaf, right))) {
+					ret = -EUCLEAN;
+					btrfs_abort_transaction(trans, ret);
+				} else {
+					wret = push_leaf_items_to_right(trans, leaf, right, 0,
+								       min_push_space, true,
+								       0, path->slots[0],
+								       &out_slot, &moved);
+					if (wret < 0)
+						ret = wret;
+					else if (wret == 0) {
+						/* right leaf's first key changed: refresh
+						 * its separator key in upper */
+						btrfs_item_key(right, &disk_key, 0);
+						btrfs_set_node_key(upper, &disk_key,
 								   slot + 1);
-					btrfs_mark_buffer_dirty(trans, upper);
+						btrfs_mark_buffer_dirty(trans, upper);
+					}
 				}
 			}
 		}
