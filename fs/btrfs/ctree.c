@@ -4726,9 +4726,14 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
 	return ret;
 }
 /*
+ * Work out what the pushes below would do, so that the whole merge can be
+ * committed to before a single item is moved.
+ *
  * Return true if the middle leaf of @bctl can be fully emptied into its
- * neighbours given the free space currently available in them.  bctl->l
- * and bctl->r may be NULL.
+ * neighbours given the free space currently available in them, and store in
+ * *left_items_ret how many items go to the left neighbour - the right
+ * neighbour then takes every item left behind.  bctl->l and bctl->r may be
+ * NULL.
  *
  * The checks mirror exactly what the push paths that follow will do: the
  * left neighbour receives the head of the middle leaf packed as tightly as
@@ -4738,22 +4743,27 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
  * that does not fit, no split can empty the leaf.
  *
  * The btrfs_calc_push_items() calls here use the same arguments the
- * pushes pass (empty=true, data_size=0, unbounded slot window), so the
- * verdict stays in exact agreement with the actual moves by construction.
- * (With those arguments path_slot only ever feeds data_size additions of
- * zero, so it plays no role here.)
+ * pushes pass (empty=true, data_size=0), so the verdict stays in exact
+ * agreement with the actual moves by construction.  With empty=true and a
+ * zero data_size path_slot only ever feeds data_size additions of zero, and
+ * both calls below already reach slot 0 - the left because its bound_slot is
+ * (u32)-1, the right because empty=true makes btrfs_calc_push_items() ignore
+ * bound_slot entirely - so neither argument can change the result, which is
+ * why the differing bound_slot values are immaterial.
  */
-static bool balance_leaf_can_empty(const struct node_balance_ctl *bctl)
+static bool balance_leaf_plan(const struct node_balance_ctl *bctl,
+			      u32 *left_items_ret)
 {
 	const struct extent_buffer *m = bctl->m;
 	const struct extent_buffer *l = bctl->l;
 	const struct extent_buffer *r = bctl->r;
 	u32 nritems = btrfs_header_nritems(m);
-	u32 left_items, right_items;
+	u32 left_items, right_items = 0;
 
 	left_items = l ? btrfs_calc_push_items(m, 0,
 				btrfs_leaf_free_space(l), (u32)-1,
 				0, true, true) : 0;
+	*left_items_ret = left_items;
 
 	if (left_items >= nritems)
 		return true;
@@ -4764,6 +4774,43 @@ static bool balance_leaf_can_empty(const struct node_balance_ctl *bctl)
 	right_items = btrfs_calc_push_items(m, 0,
 				btrfs_leaf_free_space(r), 0, 0, true, false);
 	return left_items + right_items >= nritems;
+}
+
+/*
+ * COW the left (left == true) or the right neighbour leaf of bctl->m and
+ * make sure it is still a valid sibling.
+ *
+ * This has to happen before any item is moved: batching it up front is what
+ * lets a COW failure (-ENOSPC, expected and not fatal here) abandon the
+ * merge without bctl->m having been touched and without path->slots[0]
+ * going stale.
+ *
+ * Returns 0 if the neighbour is ready to receive items, 1 if it cannot be
+ * used right now (the COW ran out of space), or a negative error code.
+ */
+static int balance_leaf_prepare_sibling(struct btrfs_trans_handle *trans,
+					struct btrfs_root *root,
+					struct node_balance_ctl *bctl, bool left)
+{
+	struct extent_buffer **dst = left ? &bctl->l : &bctl->r;
+	const struct extent_buffer *m = bctl->m;
+	int ret;
+
+	ret = btrfs_cow_block(trans, root, *dst, bctl->parent,
+			      left ? bctl->pslot - 1 : bctl->pslot + 1,
+			      dst, left ? BTRFS_NESTING_LEFT_COW :
+					  BTRFS_NESTING_RIGHT_COW);
+	if (ret) {
+		/* -ENOSPC only means the merge has to be skipped for now. */
+		return ret == -ENOSPC ? 1 : ret;
+	}
+
+	if (unlikely(left ? check_sibling_keys(*dst, m) :
+			    check_sibling_keys(m, *dst))) {
+		btrfs_abort_transaction(trans, -EUCLEAN);
+		return -EUCLEAN;
+	}
+	return 0;
 }
 
 static noinline int balance_leaf(struct btrfs_trans_handle *trans,
@@ -4778,10 +4825,11 @@ static noinline int balance_leaf(struct btrfs_trans_handle *trans,
 	int sib_count;
 	int wret;
 	int out_slot;
-	u32 min_push_space;
+	u32 left_items = 0;
+	u32 right_items = 0;
 	u32 nritems;
+	bool balanced = false;
 	bool moved;
-	bool pushed_left = false;
 
 	ASSERT(upper);
 	btrfs_assert_tree_write_locked(upper);
@@ -4793,12 +4841,31 @@ static noinline int balance_leaf(struct btrfs_trans_handle *trans,
 	 * cannot have been re-pointed to it, so the subsequent right push and
 	 * the final deletion (btrfs_del_ptr() below) always see a coherent
 	 * path whose slots[1] still refers to @leaf.
+	 *
+	 * Because of that the merge is all-or-nothing: either @leaf is
+	 * emptied into its neighbours and deleted (after which the path is
+	 * unlocked and its level-0 buffer is stale - never dereference it
+	 * again), or nothing at all was moved and the path is untouched.
+	 * There is no in-between state to hand back to the caller, which is
+	 * why path->slots[0] needs no fixup here.
+	 *
+	 * The price of the policy is the occasional merge: when @leaf cannot
+	 * be emptied into both neighbours nothing is pushed at all, whereas
+	 * pushing one direction at a time could still drain it into the right
+	 * neighbour alone after the left COW failed.
 	 */
 
 	/* Acquire and lock the left/right neighbours, if present. */
 	sib_count = get_locked_siblings(path, 0, &bctl);
 	if (sib_count < 0)
 		return sib_count;
+	/* The 0/1/2 count needs no interpretation here: bctl->l and bctl->r are
+	 * NULL when no sibling of that side exists, and plan() and the two
+	 * prepare/push gates below are written to handle NULL directly (a NULL
+	 * side simply contributes zero items), so a missing sibling falls out of
+	 * the same checks as "no room" - no separate branch, and no need to tell
+	 * "root node" from "parent exists but has no neighbours".
+	 */
 
 	/*
 	 * Only bother with the neighbours if @leaf can actually be emptied
@@ -4808,100 +4875,111 @@ static noinline int balance_leaf(struct btrfs_trans_handle *trans,
 	 * prefix over would only fill them - making a later complete merge
 	 * harder - plus COW and dirty them for no net gain.  Dirtying of
 	 * @leaf is not this function's job: btrfs_del_items() marks it after
-	 * deleting the items, and the item moves mark it on survival and
-	 * clear it when they empty it, which is what btrfs_del_leaf() needs.
+	 * deleting the items, and the item moves clear it again when they
+	 * empty @leaf, which is what btrfs_del_leaf() needs.
 	 */
-	if (btrfs_header_nritems(leaf) &&
-	    balance_leaf_can_empty(&bctl)) {
-		/*
-		 * Push as much as possible to the left neighbour.  We want to
-		 * be able to move at least the first item there.  @leaf is
-		 * guaranteed non-empty here.
-		 */
-		if (bctl.l) {
-			min_push_space = sizeof(struct btrfs_item) +
-					 btrfs_item_size(leaf, 0);
+	nritems = btrfs_header_nritems(leaf);
+	if (!nritems || !balance_leaf_plan(&bctl, &left_items))
+		goto out;
 
-			if (btrfs_leaf_free_space(bctl.l) >= min_push_space) {
-				wret = btrfs_cow_block(trans, root, bctl.l,
-						       bctl.parent, bctl.pslot - 1,
-						       &bctl.l, BTRFS_NESTING_LEFT_COW);
-				if (wret < 0) {
-					if (wret != -ENOSPC)
-						ret = wret;
-				} else if (unlikely(check_sibling_keys(bctl.l, leaf))) {
-					ret = -EUCLEAN;
-					btrfs_abort_transaction(trans, ret);
-				} else {
-					wret = push_leaf_items_to_left(trans, leaf, bctl.l, 0,
-								       min_push_space, true,
-								       (u32)-1, path->slots[0],
-								       &out_slot, &moved);
-					if (wret < 0)
-						ret = wret;
-					else if (wret == 0)
-						pushed_left = true;
-				}
-			}
-		}
+	if (left_items >= nritems)
+		right_items = 0;
+	else
+		right_items = nritems - left_items;
 
-		/*
-		 * Then push whatever is left to the right neighbour.  Unlike the
-		 * old path-based code, this no longer depends on whether the path
-		 * still points at @leaf - the left push above never re-pointed it - so it
-		 * always runs as long as @leaf still has items, which is what allows
-		 * the leaf to be merged into both neighbours at once.
-		 */
-		if (bctl.r && btrfs_header_nritems(leaf)) {
-			nritems = btrfs_header_nritems(leaf);
-			min_push_space = leaf_space_used(leaf, 0, nritems);
+	/*
+	 * COW both neighbours before moving anything: bailing out here leaves
+	 * @leaf untouched, so path->slots[0] still describes it.  The tree is
+	 * not untouched - a neighbour COWed before the failure keeps its new
+	 * block and @upper its updated pointer - but an unmodified COW is
+	 * legal, so that costs only a wasted allocation.
+	 */
+	if (left_items) {
+		wret = balance_leaf_prepare_sibling(trans, root, &bctl, true);
+		if (wret < 0)
+			ret = wret;
+		if (wret)
+			goto out;
+	}
 
-			if (btrfs_leaf_free_space(bctl.r) >= min_push_space) {
-				wret = btrfs_cow_block(trans, root, bctl.r,
-						       bctl.parent, bctl.pslot + 1,
-						       &bctl.r, BTRFS_NESTING_RIGHT_COW);
-				if (wret < 0) {
-					if (wret != -ENOSPC)
-						ret = wret;
-				} else if (unlikely(check_sibling_keys(leaf, bctl.r))) {
-					ret = -EUCLEAN;
-					btrfs_abort_transaction(trans, ret);
-				} else {
-					wret = push_leaf_items_to_right(trans, leaf, bctl.r, 0,
-								       min_push_space, true,
-								       0, path->slots[0],
-								       &out_slot, &moved);
-					if (wret < 0)
-						ret = wret;
-					else if (wret == 0) {
-						/* right leaf's first key changed:
-						 * refresh its separator key in upper */
-						btrfs_item_key(bctl.r, &disk_key, 0);
-						btrfs_set_node_key(bctl.parent, &disk_key,
-								   bctl.pslot + 1);
-						btrfs_mark_buffer_dirty(trans, bctl.parent);
-					}
-				}
-			}
+	if (right_items) {
+		wret = balance_leaf_prepare_sibling(trans, root, &bctl, false);
+		if (wret < 0)
+			ret = wret;
+		if (wret)
+			goto out;
+	}
+
+	/*
+	 * Both neighbours are COWed and are known to have room for exactly
+	 * what they are asked to take, so neither push can come back empty
+	 * handed: the left takes @left_items items off the head of @leaf and
+	 * the right takes all @right_items that are left behind, which
+	 * empties @leaf.  The slots the pushes report are deliberately
+	 * unused - the leaf they describe is deleted below - and discarding
+	 * them is safe only because no push runs before both neighbours are
+	 * ready, so the path never describes a half merged @leaf.
+	 */
+	if (left_items) {
+		wret = push_leaf_items_to_left(trans, leaf, bctl.l, 0,
+					       sizeof(struct btrfs_item) +
+					       btrfs_item_size(leaf, 0),
+					       true, (u32)-1, path->slots[0],
+					       &out_slot, &moved);
+		if (WARN_ON(wret)) {
+			ret = -EUCLEAN;
+			btrfs_abort_transaction(trans, ret);
+			goto out;
 		}
 	}
 
+	if (right_items) {
+		nritems = btrfs_header_nritems(leaf);
+		wret = push_leaf_items_to_right(trans, leaf, bctl.r, 0,
+						leaf_space_used(leaf, 0, nritems),
+						true, 0, path->slots[0],
+						&out_slot, &moved);
+		if (WARN_ON(wret)) {
+			ret = -EUCLEAN;
+			btrfs_abort_transaction(trans, ret);
+			goto out;
+		}
+
+		/* the right leaf's first key changed: refresh it in upper */
+		btrfs_item_key(bctl.r, &disk_key, 0);
+		btrfs_set_node_key(bctl.parent, &disk_key, bctl.pslot + 1);
+		btrfs_mark_buffer_dirty(trans, bctl.parent);
+	}
+
+	/*
+	 * By construction @leaf is empty here.  Check it instead of trusting
+	 * the accounting: a leaf that survived a "complete" merge would be
+	 * left behind with a path->slots[0] that no longer describes it.
+	 */
+	if (WARN_ON(btrfs_header_nritems(leaf))) {
+		ret = -EUCLEAN;
+		btrfs_abort_transaction(trans, ret);
+		goto out;
+	}
+	balanced = true;
+
+out:
 	free_balance_control(&bctl);
 
 	/*
-	 * If @leaf survived, its first key may have changed because we moved
-	 * its head items to the left neighbour; refresh the parent keys up the
-	 * tree (path-dependent, done here in the caller).  If @leaf is empty
-	 * we delete it below and btrfs_del_ptr() takes care of the upper keys,
-	 * so this is skipped.
+	 * If @leaf was emptied it has to go: btrfs_del_ptr() drops its
+	 * separator key from @upper and btrfs_del_leaf() clears the level-0
+	 * lock (btrfs_unlock_up_safe()), so callers which re-check
+	 * path->locks[0] see that @leaf is gone.  path->nodes[0] still points
+	 * at the released buffer though: it is stale, do not dereference it.
+	 * If the leaf was not emptied, @leaf and the path are untouched and
+	 * the caller can carry on with them.
+	 *
+	 * path->slots[1] needs no refresh here: get_locked_siblings() recorded
+	 * it in bctl.pslot and nothing in this function writes it, so @upper
+	 * and its slot are still the ones the path describes.
 	 */
-	if (btrfs_header_nritems(leaf) && pushed_left) {
-		btrfs_item_key(leaf, &disk_key, 0);
-		fixup_low_keys(trans, path, &disk_key, 1);
-	}
-
-	if (btrfs_header_nritems(leaf) == 0) {
-		path->slots[1] = bctl.pslot;
+	if (balanced) {
 		ret = btrfs_del_leaf(trans, root, path, leaf);
 		if (ret < 0)
 			return ret;
